@@ -51,11 +51,12 @@ Codex ──▶ 前置 :18787 ──▶ 真网关 :18788 ──▶ 上游（你�
 
 ### 翻译服务与 Key（自备，仓库里没有任何 key）
 
-翻译要调第三方接口，**key 全部自己准备，费用走自己的账**，本仓库不带、
-不收、不要任何人的 key：
+翻译要调第三方接口，**服务自己挑便宜的用，key 自己准备，费用走自己的账**，
+本仓库不带、不收、不要任何人的 key。我用的是小米的 token 专线，便宜量大；
+更便宜的甚至免费的一大把，中翻英这种活一般的 LLM 都干得了，自己比价就是。
 
-- MIMO 系走小米 token 专线（默认 `https://token-plan-cn.xiaomimimo.com/v1`），
-  key 放 `~/.codex/mimo.key`（0600）或 `MIMO_API_KEY` 环境变量；
+- `mimo*` 模型默认走 `https://token-plan-cn.xiaomimimo.com/v1`，key 放
+  `~/.codex/mimo.key`（0600）或 `MIMO_API_KEY` 环境变量；
 - 其他模型走 OpenCode Go（`https://opencode.ai/zen/go/v1/chat/completions`），
   key 顺序：`~/.codex/opencode-go.key` → `OPENCODE_API_KEY`；
 - 备用翻译默认 `muse-spark-1.3-contributor`（Control Page 可改，填 `-` 关闭）。
