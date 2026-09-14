@@ -2,7 +2,10 @@
 
 package tray
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 // samplePoint sits inside the accent square but outside both backdrop cuts
 // for the 32px render.
@@ -50,6 +53,28 @@ func sampleAccentDim() (uint8, uint8, uint8) {
 	x, y := 32*11/16, 32*10/16
 	off := (y*32 + x) * 4
 	return pix[off+1], pix[off+2], pix[off+3]
+}
+
+func TestBlinkHoldWindow(t *testing.T) {
+	now := time.Now()
+	if blinkDim(false, true, now, now) {
+		t.Fatal("fault must stay steady red")
+	}
+	if blinkDim(true, true, time.Time{}, now) {
+		t.Fatal("never-active must not blink")
+	}
+	if !blinkDim(true, true, now, now) {
+		t.Fatal("active translating must show dim on phase")
+	}
+	if blinkDim(true, false, now, now) {
+		t.Fatal("off phase must show steady green")
+	}
+	if !blinkDim(true, true, now.Add(-4*time.Second), now) {
+		t.Fatal("hold window must still blink")
+	}
+	if blinkDim(true, true, now.Add(-6*time.Second), now) {
+		t.Fatal("expired hold must stop blinking")
+	}
 }
 
 func TestLegacyIconUnchanged(t *testing.T) {

@@ -116,22 +116,24 @@ func Run(onActivate func(), status func() (bool, bool, string)) error {
 	// Painted signature, so idle ticks stay silent on the bus.
 	last := ""
 	phase := false
+	var lastActive time.Time
 	tick := func() {
+		now := time.Now()
 		ok, translating, text := true, false, "Codex Lang 运行中，点按打开 Control Page"
 		if status != nil {
 			ok, translating, text = status()
 		}
+		phase = !phase
 		if translating && ok {
-			phase = !phase
-		} else {
-			phase = false
+			lastActive = now
 		}
-		sig := paintSig(ok, translating && ok && phase, text)
+		dim := blinkDim(ok, phase, lastActive, now)
+		sig := paintSig(ok, dim, text)
 		if sig == last {
 			return
 		}
 		last = sig
-		emit(statusPixmap(ok, translating && ok && phase), statusTip(ok, text))
+		emit(statusPixmap(ok, dim), statusTip(ok, text))
 	}
 	tick()
 	ticker := time.NewTicker(pollInterval)
@@ -140,6 +142,19 @@ func Run(onActivate func(), status func() (bool, bool, string)) error {
 		tick()
 	}
 	return nil
+}
+
+// blinkHold keeps the blink going a few seconds after the last observed
+// translating poll, so even a sub-second call reads as a visible blink.
+const blinkHold = 5 * time.Second
+
+// blinkDim reports whether the dim blink phase shows: healthy, inside the
+// trailing hold window of observed translating activity, on blink phase.
+func blinkDim(ok, phase bool, lastActive, now time.Time) bool {
+	if !ok || lastActive.IsZero() {
+		return false
+	}
+	return !now.After(lastActive.Add(blinkHold)) && phase
 }
 
 func paintSig(ok, dim bool, text string) string {
