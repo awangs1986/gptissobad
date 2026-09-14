@@ -1,0 +1,11 @@
+* text=auto eol=lf
+*.go text eol=lf
+*.sh text eol=lf
+*.html text eol=lf
+*.css text eol=lf
+*.js text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+*.desktop text eol=lf
+AppRun text eol=lf
+*.png binary

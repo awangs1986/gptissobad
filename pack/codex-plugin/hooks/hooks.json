@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh ${PLUGIN_ROOT}/hooks/ensure_services.sh",
+            "timeout": 10,
+            "statusMessage": "Ensuring Local Gateway"
+          }
+        ]
+      }
+    ]
+  }
+}

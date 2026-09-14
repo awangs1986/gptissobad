@@ -1,0 +1,5 @@
+{
+  "name": "codex-lang-ensure",
+  "version": "1.0.0",
+  "description": "Ensure the codex-lang front door and Local Gateway are running when a Codex session starts. SessionStart only; never reads prompts, keys, or bodies."
+}

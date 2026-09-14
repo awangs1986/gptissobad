@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Codex Lang
+Comment=Local Gateway watchdog for Codex Chinese prompts
+Exec=codex-watchdog
+Icon=codex-lang
+Terminal=false
+Categories=Development;Utility;
+StartupNotify=false
+X-AppImage-Name=CodexLang

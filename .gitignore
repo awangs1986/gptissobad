@@ -1,0 +1,8 @@
+.worktrees/
+.env
+.env.*
+*.pem
+*.key
+auth.json
+codex-lang.json
+dist/
