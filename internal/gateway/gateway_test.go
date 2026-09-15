@@ -441,7 +441,8 @@ func TestQuotaFromEitherSideNamesQuota(t *testing.T) {
 	}))
 	t.Cleanup(primary.Close)
 	fallback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "slow down", http.StatusTooManyRequests)
+		// Policy §5: quota is named by the body, not by the status alone.
+		http.Error(w, "额度已用尽，请充值", http.StatusTooManyRequests)
 	}))
 	t.Cleanup(fallback.Close)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -834,7 +835,7 @@ func TestExplicitTranslatorURLWinsOverMimoRoute(t *testing.T) {
 
 func TestTranslatorQuotaNamesQuota(t *testing.T) {
 	fx := startFixture(t, gateway.Config{APIKey: "go-key"}, nil, func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "quota exhausted", http.StatusTooManyRequests)
+		http.Error(w, "额度用尽：本月额度已用完", http.StatusTooManyRequests)
 	})
 	body := []byte(`{"model":"gpt-5.3-codex","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"修复登录的 bug。"}]}]}`)
 	resp := postJSON(t, fx.gateway.URL+"/v1/responses", "Bearer client-key", body)
@@ -1537,5 +1538,146 @@ func TestUnknownUserPartWithHanIsForwarded(t *testing.T) {
 	}
 	if fx.upstream.count() != 1 {
 		t.Fatalf("upstream received %d requests, want 1 forwarded", fx.upstream.count())
+	}
+}
+
+func TestBareRateLimitRetriesThenFailsClosed(t *testing.T) {
+	// translation-policy.md §5: quota means 429/402 whose body names 额度.
+	// A bare 429 is a busy backend: retry once, paced, then fail closed with
+	// the generic message instead of telling the user the quota is gone.
+	fx := startFixture(t, gateway.Config{APIKey: "go-key"}, nil, func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "slow down", http.StatusTooManyRequests)
+	})
+	body := []byte(`{"model":"gpt-5.3-codex","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"修复登录的 bug。"}]}]}`)
+	resp := postJSON(t, fx.gateway.URL+"/v1/responses", "Bearer client-key", body)
+	raw, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status %d, want 403", resp.StatusCode)
+	}
+	if bytes.Contains(raw, []byte("额度")) {
+		t.Fatalf("body %q must not claim quota for a bare 429", raw)
+	}
+	if fx.translator.count() != 2 {
+		t.Fatalf("translator called %d times, want 2 (one paced retry)", fx.translator.count())
+	}
+	if fx.upstream.count() != 0 {
+		t.Fatalf("upstream received %d requests, want 0", fx.upstream.count())
+	}
+}
+
+func TestTruncatedTranslationFailsClosed(t *testing.T) {
+	// finish_reason=length means the translator ran out of output budget.
+	// The fragment used to pass the Han check, get cached and be forwarded
+	// as the user's prompt; now it fails closed and says so.
+	fx := startFixture(t, gateway.Config{APIKey: "go-key"}, nil, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"Fix the login"},"finish_reason":"length"}],"usage":{"prompt_tokens":9,"completion_tokens":4,"total_tokens":13}}`))
+	})
+	body := []byte(`{"model":"gpt-5.3-codex","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"修复登录的 bug：登录一直失败，需要看日志。修复登录的 bug：登录一直失败，需要看日志。"}]}]}`)
+	resp := postJSON(t, fx.gateway.URL+"/v1/responses", "Bearer client-key", body)
+	raw, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status %d, want 403", resp.StatusCode)
+	}
+	if !bytes.Contains(raw, []byte("截断")) {
+		t.Fatalf("body %q must name truncation", raw)
+	}
+	if fx.upstream.count() != 0 {
+		t.Fatalf("upstream received %d requests, want 0", fx.upstream.count())
+	}
+}
+
+func TestOversizedLineIsSplitWithoutInventingNewlines(t *testing.T) {
+	// The chunk cap is the fix for "a long paste looks like the translator
+	// is unreachable": one over-long line becomes several bounded requests,
+	// and reassembly must not insert newlines that were never in the input.
+	var mu sync.Mutex
+	var sizes []int
+	fx := startFixture(t, gateway.Config{APIKey: "go-key", MaxChunkRunes: 10}, nil, func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Messages []struct {
+				Content string `json:"content"`
+			} `json:"messages"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if len(req.Messages) != 2 {
+			t.Errorf("messages = %+v", req.Messages)
+		}
+		piece := req.Messages[1].Content
+		mu.Lock()
+		sizes = append(sizes, len([]rune(piece)))
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"` + strings.Repeat("b", len([]rune(piece))) + `"},"finish_reason":"stop"}]}`))
+	})
+	// Distinct content per piece: identical pieces would be served from
+	// the hash cache and never reach the translator.
+	line := "第一段修复登录。第二段修复支付。第三段修复搜索。第四段修复上传。"
+	body := []byte(`{"model":"gpt-5.3-codex","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"` + line + `"}]}]}`)
+	resp := postJSON(t, fx.gateway.URL+"/v1/responses", "Bearer client-key", body)
+	raw, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d %s", resp.StatusCode, raw)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(sizes) != 4 {
+		t.Fatalf("translator calls = %v, want 4 pieces of <=10 runes", sizes)
+	}
+	if sizes[3] != 2 {
+		t.Fatalf("last piece = %d runes, want the 2-rune remainder", sizes[3])
+	}
+	for _, n := range sizes {
+		if n > 10 {
+			t.Fatalf("piece size = %d, want <= 10", n)
+		}
+	}
+	joined := strings.Repeat("b", 32)
+	if !bytes.Contains(fx.upstream.lastBody(), []byte("Please reply in Chinese.\\n"+joined)) {
+		t.Fatalf("reassembled text missing or newline-split: %s", fx.upstream.lastBody())
+	}
+}
+
+func TestMimoKeyAloneIsEnoughToTranslate(t *testing.T) {
+	// The Xiaomi route carries its own credential: an empty OpenCode Go key
+	// must not silently forward Chinese untranslated (that bug also killed
+	// the panel blink, because no translator call ever started).
+	var xiaomiCalls int
+	xiaomi := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		xiaomiCalls++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"Fix it."},"finish_reason":"stop"}]}`))
+	}))
+	t.Cleanup(xiaomi.Close)
+	upstream := &recorded{}
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstream.add(r)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"up"}`))
+	}))
+	t.Cleanup(up.Close)
+	impl := gateway.New(gateway.Config{
+		Upstream:    up.URL,
+		APIKey:      "", // no OpenCode Go credential at all
+		Model:       "mimo-v2.5",
+		MimoAPIKey:  "mimo-test-key",
+		MimoBaseURL: xiaomi.URL,
+	})
+	srv := httptest.NewServer(impl)
+	t.Cleanup(srv.Close)
+	body := []byte(`{"model":"gpt-5.3-codex","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"修复一下。"}]}]}`)
+	resp := postJSON(t, srv.URL+"/v1/responses", "Bearer client-key", body)
+	if resp.StatusCode != http.StatusOK {
+		got, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status %d %s", resp.StatusCode, got)
+	}
+	if xiaomiCalls != 1 {
+		t.Fatalf("mimo calls = %d, want 1", xiaomiCalls)
+	}
+	if !bytes.Contains(upstream.lastBody(), []byte("Fix it.")) {
+		t.Fatalf("turn forwarded untranslated: %s", upstream.lastBody())
 	}
 }
