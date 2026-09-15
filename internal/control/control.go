@@ -156,6 +156,27 @@ func (r *Runtime) readKey() (string, opencodego.KeySource) {
 	return opencodego.ResolveKey(r.paths.keyFile(), r.paths.PiAuthFile)
 }
 
+// mimoModel reports whether the configured model is served by the Xiaomi
+// direct route rather than the OpenCode Go chain.
+func mimoModel(model string) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(model)), "mimo")
+}
+
+// readTranslatorKey returns the credential the *configured* route will use,
+// plus a label for the page. A mimo model prefers the Xiaomi key (file or
+// environment) because that is exactly what gateway.translatorTarget() picks;
+// reporting the OpenCode credential alone made a working mimo-only setup look
+// keyless in the Control Page and in the watchdog's tray colour.
+func (r *Runtime) readTranslatorKey() (string, string) {
+	if mimoModel(r.settings.Model) {
+		if k := strings.TrimSpace(gateway.ResolveMimoKey()); k != "" {
+			return k, "mimo-key"
+		}
+	}
+	key, source := r.readKey()
+	return key, string(source)
+}
+
 func (r *Runtime) writeKey(key string) error {
 	if err := os.MkdirAll(r.paths.Dir, 0o700); err != nil {
 		return err
@@ -247,7 +268,7 @@ func (r *Runtime) stateLocked() State {
 	if r.gateway != nil {
 		metrics = r.gateway.Metrics()
 	}
-	key, keySource := r.readKey()
+	key, keySource := r.readTranslatorKey()
 	// Codex always points at the front door when it is enabled; the TOML
 	// and the listen line must show the front port, never the internal
 	// real-gateway port.
@@ -276,7 +297,7 @@ func (r *Runtime) stateLocked() State {
 		HasKey:         key != "",
 		FrontReachable: r.frontReachableLocked(),
 		Translating:    metrics.Translating,
-		KeySource:      string(keySource),
+		KeySource:      keySource,
 		TOML:           gateway.ConfigTOMLFor(tomlPort, r.settings.BasePath),
 		Metrics:        metrics,
 	}
@@ -437,9 +458,9 @@ func (r *Runtime) CheckTranslator(ctx context.Context) error {
 	key, _ := r.readKey()
 	model := r.settings.Model
 	r.mu.Unlock()
-	if strings.TrimSpace(key) == "" {
-		return errors.New("未找到 OpenCode Go 登录凭据")
-	}
+	// gateway.CheckTranslator is route-aware: it probes whichever credential
+	// the configured model actually needs, so a mimo-only setup gets a real
+	// check instead of being refused for a missing OpenCode Go key.
 	return gateway.New(gateway.Config{APIKey: key, Model: model}).CheckTranslator(ctx)
 }
 
@@ -567,9 +588,13 @@ func (r *Runtime) startLocked() error {
 	})
 	r.listener = ln
 	r.gateway = gw
-	r.server = &http.Server{Handler: gw, ReadHeaderTimeout: 10 * time.Second}
+	// Capture the server in the goroutine: stopLocked() nils r.server, and a
+	// fast stop (tests, restart, disable) used to race with this Serve call
+	// and panic on the nil pointer.
+	srv := &http.Server{Handler: gw, ReadHeaderTimeout: 10 * time.Second}
+	r.server = srv
 	go func() {
-		_ = r.server.Serve(ln)
+		_ = srv.Serve(ln)
 	}()
 	return nil
 }
@@ -700,9 +725,10 @@ func (r *Runtime) startFrontLocked() error {
 		r.settings.FrontPort = strconv.Itoa(tcp.Port)
 	}
 	r.frontListener = ln
-	r.frontServer = &http.Server{Handler: front, ReadHeaderTimeout: 10 * time.Second}
+	frontSrv := &http.Server{Handler: front, ReadHeaderTimeout: 10 * time.Second}
+	r.frontServer = frontSrv
 	go func() {
-		_ = r.frontServer.Serve(ln)
+		_ = frontSrv.Serve(ln)
 	}()
 	r.Log("Front door listening on " + ln.Addr().String() + " -> " + backend)
 	return nil

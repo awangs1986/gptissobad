@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
 	"syscall"
 	"time"
 
@@ -64,7 +65,11 @@ func main() {
 	}()
 
 	log.Printf("Control Page %s", page)
-	if *noTray || !tray.Available() {
+	if *noTray {
+		select {}
+	}
+	if !tray.Available() {
+		log.Printf("panel icon not available on %s; the Control Page stays up at %s", runtime.GOOS, page)
 		select {}
 	}
 	if err := tray.Run(func() {
@@ -79,7 +84,7 @@ func main() {
 			return true, true, "正在翻译…，点按打开 Control Page"
 		}
 		return true, false, "翻译正常，点按打开 Control Page"
-	}); err != nil {
+	}, func(msg string) { log.Print(msg) }); err != nil {
 		log.Printf("panel icon unavailable: %v", err)
 		log.Printf("open %s from the browser, or pin the AppImage to the Mint panel", page)
 		select {}
