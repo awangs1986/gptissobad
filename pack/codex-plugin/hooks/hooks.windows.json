@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${PLUGIN_ROOT}/hooks/ensure_services.ps1\"",
+            "timeout": 10,
+            "statusMessage": "Ensuring Local Gateway"
+          }
+        ]
+      }
+    ]
+  }
+}

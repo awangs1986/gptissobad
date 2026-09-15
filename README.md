@@ -1,6 +1,6 @@
 # 本项目更像一个安慰剂，很可能屁用没有
 
-# gptissobad —— 给中文用户用的 Codex 本机翻译网关（Linux 版）
+# gptissobad —— 给中文用户用的 Codex 本机翻译网关（Linux / Windows / macOS）
 
 > **作者没有 CODEX 可用，本项目由万恶的 MUSE SPARK 1.3 开发完成。**
 >
@@ -8,7 +8,11 @@
 > 发给上游，并让回答保持中文，中间任何一环出问题都不掐断对话。
 > **不保证对任何一个人有效**——上游模型、翻译服务、网络随时会变，能不能用、
 > 好不好用，自己实测为准。
-> 这是 **LINUX 版**，其他操作系统请把代码拉下去，用 AI 改编成自己系统的版本。
+> 平台支持：**Linux 全功能**（Mint/Xfce 托盘已实测）；**Windows 已实现**——原生
+> 通知区图标、自带 `.ico` 渲染、Control Page 与前置进程都走同一套纯 Go 代码，代码层面
+> 已通过 `GOOS=windows` 的编译与 `go vet`（三个架构），但作者没有 Windows 机器实测；
+> **macOS 可构建可运行**，菜单栏图标暂缺（不引入 cgo 就到不了 Objective-C 运行时），
+> 用 Control Page 代替，详见下面「构建与运行」。
 
 ## 它解决什么
 
@@ -34,7 +38,8 @@ Codex ──▶ 前置 :18787 ──▶ 真网关 :18788 ──▶ 上游（你�
 三个二进制（`go build` 出来即用）：
 
 - `codex-watchdog`：Control Page（`http://127.0.0.1:18786/`）+ 真网关 + 可选托盘图标。
-  托盘图标绿=正常、红=停止或故障、翻译中闪烁，点按打开 Control Page。
+  托盘图标绿=正常、红=停止或故障、翻译中闪烁，点按打开 Control Page；Linux 走 SNI，
+  Windows 走通知区（无 godbus 依赖），macOS 目前没有图标、只留 Control Page。
 - `codex-fronthost`：前置轻进程。只做透传：后端不在就 403（`网关未就绪`），
   后端的 403 原样透传，WebSocket 一律拒绝。它不翻译、不记正文、不花 token。
 - `codex-translate`：无界面版网关（环境变量配置），适合手动跑。
@@ -118,8 +123,57 @@ env_key = "CODEX_TRANSLATE_KEY"
 一键装插件与自启（含 Codex `SessionStart` 自动拉起）：
 
 ```sh
-./scripts/install-plugin.sh
+./scripts/install-plugin.sh          # Linux / macOS
 ```
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\install-plugin.ps1   # Windows
+```
+
+两个脚本做同一件事：`go build` 三个二进制 → 装到 `~/.local/bin`（Windows 是
+`%USERPROFILE%\.codex\bin`）→ 拷插件 → 装自启（Linux `.desktop`、macOS LaunchAgent、
+Windows 启动文件夹快捷方式）→ 合并个人 marketplace 条目。Windows 脚本还会把插件的
+`hooks.json` 换成 PowerShell 版本（`hooks.windows.json`），因为 Codex 在 Windows 上
+不一定有 `sh`。
+
+## 构建与运行（Windows / macOS）
+
+三个二进制都是纯 Go（唯一依赖 godbus 只在 Linux 托盘里用到），交叉编译即得：
+
+```sh
+# Windows（在 Linux/macOS 上交叉编译，或直接在 Windows 上 go build）
+GOOS=windows GOARCH=amd64 go build -o codex-watchdog.exe ./cmd/codex-watchdog
+GOOS=windows GOARCH=amd64 go build -o codex-fronthost.exe ./cmd/codex-fronthost
+GOOS=windows GOARCH=amd64 go build -o codex-translate.exe ./cmd/codex-translate
+# 想让它没有控制台黑窗，加 -ldflags "-H windowsgui"（日志仍可在 Control Page 看到）
+
+# macOS
+GOOS=darwin GOARCH=arm64 go build -o codex-watchdog ./cmd/codex-watchdog
+GOOS=darwin GOARCH=arm64 go build -o codex-fronthost ./cmd/codex-fronthost
+GOOS=darwin GOARCH=arm64 go build -o codex-translate ./cmd/codex-translate
+```
+
+跑 `codex-watchdog`（Windows 直接双击，或 `codex-watchdog.exe --no-tray` 只看网页），
+然后打开 `http://127.0.0.1:18786/`。其余步骤与 Linux 相同，密钥、缓存、配置路径都
+在 `~/.codex/`（Windows 是 `%USERPROFILE%\.codex\`）。
+
+开机自启由安装脚本负责（不属于二进制本身）：Windows 脚本往启动文件夹放一个
+`codex-lang.lnk`（目标 `codex-watchdog.exe`，窗口最小化；想完全无窗口就把二进制用
+`-ldflags "-H windowsgui"` 再构建一次，README 上面的命令有注明）；macOS 脚本写
+`~/Library/LaunchAgents/local.codex-lang.watchdog.plist`（`RunAtLoad`）并尝试
+`launchctl bootstrap gui/$UID` 载入。想手动来也行：Windows 任务计划程序加一条「登录时运行」，
+macOS 直接把可执行文件加进「登录项」。
+
+跨平台上的已知差异：
+
+- 托盘图标：Linux/Windows 有，macOS 没有（会打印一行提示，其余功能照常）；
+- 前端点击、`/api/test`、翻译路由、`/api/logs` 等全部平台一致；
+- Codex 插件的 `SessionStart` 钩子三平台齐了：`ensure_services.sh`（Linux/macOS，
+  macOS 上没有 `setsid` 会自动退回 `nohup`）、`ensure_services.ps1` + `ensure_services.cmd`
+  （Windows，脚本会切换 `hooks.json`）；
+- 仍然是 Linux 专用的：AppImage 打包、`.desktop` 文件本身、以及 macOS 的菜单栏图标
+  （要菜单栏图标就得引入 cgo + Objective-C 运行时，这个项目明确不做——那会毁掉交叉编译，
+  而 Control Page 已经够用）。
 
 ## 目录结构
 
@@ -128,7 +182,7 @@ env_key = "CODEX_TRANSLATE_KEY"
 - `internal/fronthost/`：前置轻进程；
 - `internal/control/`：Control Page 与配置（`frontend/` 为页面）；
 - `internal/opencodego/`：OpenCode 凭据约定；
-- `internal/tray/`：Linux 托盘图标（SNI）；
+- `internal/tray/`：托盘图标（Linux SNI / Windows 通知区 + `.ico` 渲染 / macOS 无图标桩）；
 - `docs/spec/`：设计文档（最高策略见 `translation-policy.md`）；
 - `docs/research/`：调研笔记；
 - `pack/`：Codex 插件与打包文件；`scripts/`：安装脚本。
@@ -137,8 +191,8 @@ env_key = "CODEX_TRANSLATE_KEY"
 
 - 出生原因就是 GPT 繁忙难用，但**不承诺解决任何人的繁忙问题**，也不承诺
   任何效果；模型与上游策略随时会变，以你实测为准；
-- 仅在 Linux 验证过（Mint/Xfce托盘），Windows/macOS 请自行用 AI 改编，
-  托盘、自启、沙箱相关代码都要动；
+- Linux 已实测（Mint/Xfce 托盘）；Windows 的托盘与移植代码只做了编译与 `go vet`
+  层面的验证，未在真实 Windows 桌面上跑过；macOS 能构建、能跑，但没有菜单栏图标；
 - 你的中文原文会发给**你自己配置**的翻译服务（ unavoidable，做翻译就得给人看），
   介意者勿用；
 - Issue 欢迎带 Control Page 日志行与指标截图（不要贴 key 和正文）。

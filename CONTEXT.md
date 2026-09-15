@@ -54,5 +54,10 @@ _Avoid_: user hook file, marketplace listing, public plugin
 The local web UI that turns the Local Gateway on or off, edits Translator Backend settings, and shows runtime logs. It never displays API keys after save.
 
 **Watchdog**:
-The desktop process that hosts the Control Page, can sit in the Linux Mint panel, and opens that page on click. Distributed as an AppImage.
+The desktop process that hosts the Control Page, can sit in the Linux Mint panel (SNI) or the
+Windows notification area (Win32, rendered from the same pixel code as an in-memory `.ico`), and
+opens that page on click. macOS builds and runs but has no menu-bar icon yet: reaching NSStatusItem
+needs the Objective-C runtime, and the project keeps cgo off. That is a decision, not an oversight:
+breaking it would end cross-compilation (a macOS SDK plus Xcode per build host), for a convenience
+icon the Control Page already covers. Distributed as an AppImage on Linux.
 _Avoid_: system service, Windows tray app

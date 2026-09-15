@@ -1,0 +1,20 @@
+{
+  "name": "codex-lang-local",
+  "interface": {
+    "displayName": "Codex Lang Local"
+  },
+  "plugins": [
+    {
+      "name": "codex-lang-ensure",
+      "source": {
+        "source": "local",
+        "path": "./.codex/plugins/codex-lang-ensure"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}

@@ -10,12 +10,18 @@
 ## 安装
 
 ```sh
-./scripts/install-plugin.sh
+./scripts/install-plugin.sh          # Linux / macOS
 ```
 
-脚本会：`go build` 三个二进制 → 装到 `~/.local/bin` → 拷插件到
-`~/.codex/plugins/codex-lang-ensure` → 写 `~/.agents/plugins/marketplace.json`
-（个人 marketplace，不存在就建，已有就合并）。
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\install-plugin.ps1   # Windows
+```
+
+脚本会：`go build` 三个二进制 → 装到 `~/.local/bin`（Windows：`%USERPROFILE%\.codex\bin`）
+→ 拷插件到 `~/.codex/plugins/codex-lang-ensure` → 写 `~/.agents/plugins/marketplace.json`
+（个人 marketplace，不存在就建，已有就合并）→ 装自启。Windows 脚本还会把
+`hooks/hooks.json` 换成 `hooks/hooks.windows.json` 的内容，因为 Codex 在 Windows 上
+不一定有 `sh`。
 
 然后：
 
@@ -24,6 +30,19 @@
 3. CLI 里开一轮跑 `/hooks`，把 `SessionStart` 那条 review 并 trust；
 4. 验证：`curl -s http://127.0.0.1:18787/healthz` 应回 `{"ok":true}`；
 5. 把 Control Page 的 TOML 贴进 `~/.codex/config.toml`。之后每开会话都会拉前置和 Watchdog；真网关听 `18788`，Codex 只打 `18787`。网关没起就是 403，不是连接被拒。
+
+## hooks 目录
+
+| 文件 | 用途 |
+| --- | --- |
+| `ensure_services.sh` | Linux/macOS 的正牌实现（POSIX sh；没有 `setsid` 时退回 `nohup`，没有 `python3` 时用 `sed` 取端口） |
+| `ensure_services.ps1` | Windows 的正牌实现（PowerShell 5.1+，`Start-Process -WindowStyle Hidden` 拉起后台进程） |
+| `ensure_services.cmd` | Windows 备用入口：Codex 用 cmd.exe 起 hook 时，转调同目录的 `.ps1` |
+| `hooks.json` | 默认（POSIX）的 hook 声明 |
+| `hooks.windows.json` | Windows 的 hook 声明，由 `install-plugin.ps1` 覆盖到 `hooks.json` |
+
+改了其中任何一个都要在本机 `/hooks` 里重新 review + trust，否则 Codex 会跳过它。
+两套实现的行为要一起改（同一个端口探测 → 拉起 → 重新读端口 → 打开前置的流程）。
 
 ## 行为边界
 

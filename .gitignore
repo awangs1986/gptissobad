@@ -6,3 +6,11 @@
 auth.json
 codex-lang.json
 dist/
+
+# binaries built by scripts/install-plugin.sh (never committed)
+/codex-watchdog
+/codex-fronthost
+/codex-translate
+/codex-watchdog.exe
+/codex-fronthost.exe
+/codex-translate.exe
