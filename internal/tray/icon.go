@@ -20,6 +20,10 @@ var (
 	// dimAccent is the blink-off phase while translating: same hue family
 	// as healthy, clearly darker, never the fault red.
 	dimAccent = color.RGBA{R: 24, G: 70, B: 34, A: 255}
+	// dimErrAccent is the blink-off phase of the fault colour: a red icon
+	// still blinks while translating (blink is not gated on health), so it
+	// needs a dim variant of its own instead of turning green mid-blink.
+	dimErrAccent = color.RGBA{R: 92, G: 30, B: 27, A: 255}
 )
 
 func render(size int) *image.RGBA {
@@ -74,6 +78,16 @@ func IconPixmapFor(size int, ok bool) (int32, int32, []byte) {
 func IconPixmapDim(size int) (int32, int32, []byte) {
 	img := renderDim(size)
 	return pixmapBytes(img)
+}
+
+// IconPixmapDimFor renders the blink-off phase of the *current* state colour,
+// so a red icon blinks red instead of flashing green while translating.
+func IconPixmapDimFor(size int, ok bool) (int32, int32, []byte) {
+	mark := dimAccent
+	if !ok {
+		mark = dimErrAccent
+	}
+	return pixmapBytes(renderMark(size, mark))
 }
 
 func pixmapBytes(img *image.RGBA) (int32, int32, []byte) {

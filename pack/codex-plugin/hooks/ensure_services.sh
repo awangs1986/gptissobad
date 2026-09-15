@@ -26,6 +26,16 @@ log() {
   printf '%s %s\n' "$(date '+%F %T')" "$1" >>"$LOG_FILE" 2>/dev/null || true
 }
 
+spawn() {
+  # Detach the child so it outlives the Codex session that started it.
+  # Linux has setsid; macOS does not, so fall back to nohup there.
+  if command -v setsid >/dev/null 2>&1; then
+    setsid "$@" >>"$LOG_FILE" 2>&1 </dev/null &
+  else
+    nohup "$@" >>"$LOG_FILE" 2>&1 </dev/null &
+  fi
+}
+
 find_bin() {
   if command -v "$1" >/dev/null 2>&1; then
     command -v "$1"
@@ -44,25 +54,29 @@ control_up() {
   curl -fsS --max-time 2 "http://127.0.0.1:$UI_PORT/api/state" >/dev/null 2>&1
 }
 
-read_backend_from_state() {
-  STATE=$(curl -fsS --max-time 2 "http://127.0.0.1:$UI_PORT/api/state" 2>/dev/null) || return 0
-  PARSED=$(printf '%s' "$STATE" | python3 -c 'import json,sys
+json_string_field() {
+  # $1 is the field name, the document arrives on stdin.
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import json,sys
 try:
   s=json.load(sys.stdin)
-  print(s.get("gatewayPort") or "")
+  v=s.get(sys.argv[1]) or ""
+  print(v)
 except Exception:
-  print("")
-' 2>/dev/null || printf '')
+  print("")' "$1" 2>/dev/null || printf ''
+  else
+    # The Control Page serves compact JSON, so the field is one quoted string.
+    sed -n "s/.*\"$1\":\"\([^\"]*\)\".*/\1/p" | head -n 1
+  fi
+}
+
+read_backend_from_state() {
+  STATE=$(curl -fsS --max-time 2 "http://127.0.0.1:$UI_PORT/api/state" 2>/dev/null) || return 0
+  PARSED=$(printf '%s' "$STATE" | json_string_field gatewayPort)
   if [ -n "$PARSED" ]; then
     BACKEND="http://127.0.0.1:$PARSED"
   fi
-  fp=$(printf '%s' "$STATE" | python3 -c 'import json,sys
-try:
-  s=json.load(sys.stdin)
-  print(s.get("frontPort") or "")
-except Exception:
-  print("")
-' 2>/dev/null || printf '')
+  fp=$(printf '%s' "$STATE" | json_string_field frontPort)
   if [ -n "$fp" ]; then
     FRONT_PORT=$fp
   fi
@@ -72,7 +86,7 @@ if ! control_up; then
   WATCHDOG_BIN=$(find_bin codex-watchdog)
   if [ -n "$WATCHDOG_BIN" ]; then
     log "watchdog $UI_PORT down, starting"
-    setsid "$WATCHDOG_BIN" --no-tray >>"$LOG_FILE" 2>&1 < /dev/null &
+    spawn "$WATCHDOG_BIN" --no-tray
   else
     log "watchdog $UI_PORT down, codex-watchdog not on PATH nor ~/.local/bin"
   fi
@@ -99,7 +113,7 @@ if ! front_up; then
   FRONT_BIN=$(find_bin codex-fronthost)
   if [ -n "$FRONT_BIN" ]; then
     log "front $FRONT_PORT down, starting (backend $BACKEND)"
-    setsid "$FRONT_BIN" -port "$FRONT_PORT" -backend "$BACKEND" >>"$LOG_FILE" 2>&1 < /dev/null &
+    spawn "$FRONT_BIN" -port "$FRONT_PORT" -backend "$BACKEND"
   else
     log "front $FRONT_PORT down, codex-fronthost not on PATH nor ~/.local/bin"
   fi

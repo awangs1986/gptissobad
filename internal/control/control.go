@@ -37,19 +37,25 @@ const (
 	// frontPortReleaseWait bounds how long we wait for a signalled front to
 	// release its port before giving up and reporting the port unusable.
 	frontPortReleaseWait = 2 * time.Second
+	// maxContextTokens bounds the Control Page's upstream-context field:
+	// anything past this is a typo, not a model.
+	maxContextTokens = 2000000
 )
 
 type Settings struct {
-	Enabled           bool   `json:"enabled"`
-	UIPort            string `json:"uiPort"`
-	GatewayPort       string `json:"gatewayPort"`
-	Upstream          string `json:"upstream"`
-	Model             string `json:"model"`
-	FallbackModel     string `json:"fallbackModel"`
-	FrontEnabled      bool   `json:"frontEnabled"`
-	FrontPort         string `json:"frontPort"`
-	BasePath          string `json:"basePath"`
-	DirectGatewayPort string `json:"directGatewayPort,omitempty"`
+	Enabled       bool   `json:"enabled"`
+	UIPort        string `json:"uiPort"`
+	GatewayPort   string `json:"gatewayPort"`
+	Upstream      string `json:"upstream"`
+	Model         string `json:"model"`
+	FallbackModel string `json:"fallbackModel"`
+	// UpstreamContextTokens is the upstream model's context window in
+	// tokens; 0 (default) disables the gateway's coverage check.
+	UpstreamContextTokens int    `json:"upstreamContextTokens"`
+	FrontEnabled          bool   `json:"frontEnabled"`
+	FrontPort             string `json:"frontPort"`
+	BasePath              string `json:"basePath"`
+	DirectGatewayPort     string `json:"directGatewayPort,omitempty"`
 }
 
 type Paths struct {
@@ -156,6 +162,27 @@ func (r *Runtime) readKey() (string, opencodego.KeySource) {
 	return opencodego.ResolveKey(r.paths.keyFile(), r.paths.PiAuthFile)
 }
 
+// mimoModel reports whether the configured model is served by the Xiaomi
+// direct route rather than the OpenCode Go chain.
+func mimoModel(model string) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(model)), "mimo")
+}
+
+// readTranslatorKey returns the credential the *configured* route will use,
+// plus a label for the page. A mimo model prefers the Xiaomi key (file or
+// environment) because that is exactly what gateway.translatorTarget() picks;
+// reporting the OpenCode credential alone made a working mimo-only setup look
+// keyless in the Control Page and in the watchdog's tray colour.
+func (r *Runtime) readTranslatorKey() (string, string) {
+	if mimoModel(r.settings.Model) {
+		if k := strings.TrimSpace(gateway.ResolveMimoKey()); k != "" {
+			return k, "mimo-key"
+		}
+	}
+	key, source := r.readKey()
+	return key, string(source)
+}
+
 func (r *Runtime) writeKey(key string) error {
 	if err := os.MkdirAll(r.paths.Dir, 0o700); err != nil {
 		return err
@@ -214,26 +241,27 @@ func (r *Runtime) waitLogs(seq int) <-chan struct{} {
 }
 
 type State struct {
-	Enabled        bool            `json:"enabled"`
-	Running        bool            `json:"running"`
-	Listen         string          `json:"listen"`
-	FrontListen    string          `json:"frontListen,omitempty"`
-	UIListen       string          `json:"uiListen"`
-	Upstream       string          `json:"upstream"`
-	GatewayPort    string          `json:"gatewayPort"`
-	UIPort         string          `json:"uiPort"`
-	Model          string          `json:"model"`
-	FallbackModel  string          `json:"fallbackModel"`
-	FrontEnabled   bool            `json:"frontEnabled"`
-	FrontPort      string          `json:"frontPort"`
-	BasePath       string          `json:"basePath"`
-	HasKey         bool            `json:"hasKey"`
-	FrontReachable bool            `json:"frontReachable"`
-	Translating    bool            `json:"translating"`
-	TOML           string          `json:"toml"`
-	Error          string          `json:"error,omitempty"`
-	Metrics        gateway.Metrics `json:"metrics"`
-	KeySource      string          `json:"credentialSource"`
+	Enabled               bool            `json:"enabled"`
+	Running               bool            `json:"running"`
+	Listen                string          `json:"listen"`
+	FrontListen           string          `json:"frontListen,omitempty"`
+	UIListen              string          `json:"uiListen"`
+	Upstream              string          `json:"upstream"`
+	GatewayPort           string          `json:"gatewayPort"`
+	UIPort                string          `json:"uiPort"`
+	Model                 string          `json:"model"`
+	FallbackModel         string          `json:"fallbackModel"`
+	UpstreamContextTokens int             `json:"upstreamContextTokens"`
+	FrontEnabled          bool            `json:"frontEnabled"`
+	FrontPort             string          `json:"frontPort"`
+	BasePath              string          `json:"basePath"`
+	HasKey                bool            `json:"hasKey"`
+	FrontReachable        bool            `json:"frontReachable"`
+	Translating           bool            `json:"translating"`
+	TOML                  string          `json:"toml"`
+	Error                 string          `json:"error,omitempty"`
+	Metrics               gateway.Metrics `json:"metrics"`
+	KeySource             string          `json:"credentialSource"`
 }
 
 func (r *Runtime) State() State {
@@ -247,7 +275,7 @@ func (r *Runtime) stateLocked() State {
 	if r.gateway != nil {
 		metrics = r.gateway.Metrics()
 	}
-	key, keySource := r.readKey()
+	key, keySource := r.readTranslatorKey()
 	// Codex always points at the front door when it is enabled; the TOML
 	// and the listen line must show the front port, never the internal
 	// real-gateway port.
@@ -260,25 +288,26 @@ func (r *Runtime) stateLocked() State {
 		frontListen = net.JoinHostPort("127.0.0.1", r.settings.FrontPort)
 	}
 	return State{
-		Enabled:        r.settings.Enabled,
-		Running:        r.listener != nil,
-		Listen:         net.JoinHostPort("127.0.0.1", listenPort),
-		FrontListen:    frontListen,
-		UIListen:       net.JoinHostPort("127.0.0.1", r.settings.UIPort),
-		Upstream:       r.settings.Upstream,
-		GatewayPort:    r.settings.GatewayPort,
-		UIPort:         r.settings.UIPort,
-		Model:          r.settings.Model,
-		FallbackModel:  r.settings.FallbackModel,
-		FrontEnabled:   r.settings.FrontEnabled,
-		FrontPort:      r.settings.FrontPort,
-		BasePath:       r.settings.BasePath,
-		HasKey:         key != "",
-		FrontReachable: r.frontReachableLocked(),
-		Translating:    metrics.Translating,
-		KeySource:      string(keySource),
-		TOML:           gateway.ConfigTOMLFor(tomlPort, r.settings.BasePath),
-		Metrics:        metrics,
+		Enabled:               r.settings.Enabled,
+		Running:               r.listener != nil,
+		Listen:                net.JoinHostPort("127.0.0.1", listenPort),
+		FrontListen:           frontListen,
+		UIListen:              net.JoinHostPort("127.0.0.1", r.settings.UIPort),
+		Upstream:              r.settings.Upstream,
+		GatewayPort:           r.settings.GatewayPort,
+		UIPort:                r.settings.UIPort,
+		Model:                 r.settings.Model,
+		FallbackModel:         r.settings.FallbackModel,
+		UpstreamContextTokens: r.settings.UpstreamContextTokens,
+		FrontEnabled:          r.settings.FrontEnabled,
+		FrontPort:             r.settings.FrontPort,
+		BasePath:              r.settings.BasePath,
+		HasKey:                key != "",
+		FrontReachable:        r.frontReachableLocked(),
+		Translating:           metrics.Translating,
+		KeySource:             keySource,
+		TOML:                  gateway.ConfigTOMLFor(tomlPort, r.settings.BasePath),
+		Metrics:               metrics,
 	}
 }
 
@@ -289,8 +318,10 @@ type ConfigInput struct {
 	Model         string `json:"model"`
 	FallbackModel string `json:"fallbackModel"`
 	APIKey        string `json:"apiKey"`
-	FrontPort     string `json:"frontPort"`
-	BasePath      string `json:"basePath"`
+	// Pointer so 0 (disable) differs from "field not sent".
+	UpstreamContextTokens *int   `json:"upstreamContextTokens"`
+	FrontPort             string `json:"frontPort"`
+	BasePath              string `json:"basePath"`
 }
 
 func (r *Runtime) UpdateConfig(in ConfigInput) error {
@@ -323,6 +354,13 @@ func (r *Runtime) UpdateConfig(in ConfigInput) error {
 		} else {
 			r.settings.FallbackModel = f
 		}
+	}
+	if in.UpstreamContextTokens != nil {
+		n := *in.UpstreamContextTokens
+		if n != 0 && (n < 1000 || n > maxContextTokens) {
+			return fmt.Errorf("上游上下文上限要填 0（关闭）或 1000–%d 之间的整数", maxContextTokens)
+		}
+		r.settings.UpstreamContextTokens = n
 	}
 	if p := strings.TrimSpace(in.FrontPort); p != "" {
 		if err := validPort(p); err != nil {
@@ -437,9 +475,9 @@ func (r *Runtime) CheckTranslator(ctx context.Context) error {
 	key, _ := r.readKey()
 	model := r.settings.Model
 	r.mu.Unlock()
-	if strings.TrimSpace(key) == "" {
-		return errors.New("未找到 OpenCode Go 登录凭据")
-	}
+	// gateway.CheckTranslator is route-aware: it probes whichever credential
+	// the configured model actually needs, so a mimo-only setup gets a real
+	// check instead of being refused for a missing OpenCode Go key.
 	return gateway.New(gateway.Config{APIKey: key, Model: model}).CheckTranslator(ctx)
 }
 
@@ -558,18 +596,23 @@ func (r *Runtime) startLocked() error {
 	}
 	key, _ := r.readKey()
 	gw := gateway.New(gateway.Config{
-		Upstream:      upstream,
-		APIKey:        key,
-		Model:         r.settings.Model,
-		FallbackModel: r.settings.FallbackModel,
-		CacheFile:     r.paths.translateCacheFile(),
-		Log:           r.Log,
+		Upstream:              upstream,
+		APIKey:                key,
+		Model:                 r.settings.Model,
+		FallbackModel:         r.settings.FallbackModel,
+		UpstreamContextTokens: r.settings.UpstreamContextTokens,
+		CacheFile:             r.paths.translateCacheFile(),
+		Log:                   r.Log,
 	})
 	r.listener = ln
 	r.gateway = gw
-	r.server = &http.Server{Handler: gw, ReadHeaderTimeout: 10 * time.Second}
+	// Capture the server in the goroutine: stopLocked() nils r.server, and a
+	// fast stop (tests, restart, disable) used to race with this Serve call
+	// and panic on the nil pointer.
+	srv := &http.Server{Handler: gw, ReadHeaderTimeout: 10 * time.Second}
+	r.server = srv
 	go func() {
-		_ = r.server.Serve(ln)
+		_ = srv.Serve(ln)
 	}()
 	return nil
 }
@@ -700,9 +743,10 @@ func (r *Runtime) startFrontLocked() error {
 		r.settings.FrontPort = strconv.Itoa(tcp.Port)
 	}
 	r.frontListener = ln
-	r.frontServer = &http.Server{Handler: front, ReadHeaderTimeout: 10 * time.Second}
+	frontSrv := &http.Server{Handler: front, ReadHeaderTimeout: 10 * time.Second}
+	r.frontServer = frontSrv
 	go func() {
-		_ = r.frontServer.Serve(ln)
+		_ = frontSrv.Serve(ln)
 	}()
 	r.Log("Front door listening on " + ln.Addr().String() + " -> " + backend)
 	return nil

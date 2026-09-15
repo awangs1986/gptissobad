@@ -4,14 +4,20 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unicode"
@@ -441,7 +447,8 @@ func TestQuotaFromEitherSideNamesQuota(t *testing.T) {
 	}))
 	t.Cleanup(primary.Close)
 	fallback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "slow down", http.StatusTooManyRequests)
+		// Policy §5: quota is named by the body, not by the status alone.
+		http.Error(w, "额度已用尽，请充值", http.StatusTooManyRequests)
 	}))
 	t.Cleanup(fallback.Close)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -834,7 +841,7 @@ func TestExplicitTranslatorURLWinsOverMimoRoute(t *testing.T) {
 
 func TestTranslatorQuotaNamesQuota(t *testing.T) {
 	fx := startFixture(t, gateway.Config{APIKey: "go-key"}, nil, func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "quota exhausted", http.StatusTooManyRequests)
+		http.Error(w, "额度用尽：本月额度已用完", http.StatusTooManyRequests)
 	})
 	body := []byte(`{"model":"gpt-5.3-codex","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"修复登录的 bug。"}]}]}`)
 	resp := postJSON(t, fx.gateway.URL+"/v1/responses", "Bearer client-key", body)
@@ -1538,4 +1545,620 @@ func TestUnknownUserPartWithHanIsForwarded(t *testing.T) {
 	if fx.upstream.count() != 1 {
 		t.Fatalf("upstream received %d requests, want 1 forwarded", fx.upstream.count())
 	}
+}
+
+func TestBareRateLimitRetriesThenFailsClosed(t *testing.T) {
+	// translation-policy.md §5: quota means 429/402 whose body names 额度.
+	// A bare 429 is a busy backend: retry once, paced, then fail closed with
+	// the generic message instead of telling the user the quota is gone.
+	fx := startFixture(t, gateway.Config{APIKey: "go-key"}, nil, func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "slow down", http.StatusTooManyRequests)
+	})
+	body := []byte(`{"model":"gpt-5.3-codex","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"修复登录的 bug。"}]}]}`)
+	resp := postJSON(t, fx.gateway.URL+"/v1/responses", "Bearer client-key", body)
+	raw, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status %d, want 403", resp.StatusCode)
+	}
+	if bytes.Contains(raw, []byte("额度")) {
+		t.Fatalf("body %q must not claim quota for a bare 429", raw)
+	}
+	if fx.translator.count() != 2 {
+		t.Fatalf("translator called %d times, want 2 (one paced retry)", fx.translator.count())
+	}
+	if fx.upstream.count() != 0 {
+		t.Fatalf("upstream received %d requests, want 0", fx.upstream.count())
+	}
+}
+
+func TestTruncatedTranslationFailsClosed(t *testing.T) {
+	// finish_reason=length means the translator ran out of output budget.
+	// The fragment used to pass the Han check, get cached and be forwarded
+	// as the user's prompt; now it fails closed and says so.
+	fx := startFixture(t, gateway.Config{APIKey: "go-key"}, nil, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"Fix the login"},"finish_reason":"length"}],"usage":{"prompt_tokens":9,"completion_tokens":4,"total_tokens":13}}`))
+	})
+	body := []byte(`{"model":"gpt-5.3-codex","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"修复登录的 bug：登录一直失败，需要看日志。修复登录的 bug：登录一直失败，需要看日志。"}]}]}`)
+	resp := postJSON(t, fx.gateway.URL+"/v1/responses", "Bearer client-key", body)
+	raw, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status %d, want 403", resp.StatusCode)
+	}
+	if !bytes.Contains(raw, []byte("截断")) {
+		t.Fatalf("body %q must name truncation", raw)
+	}
+	if fx.upstream.count() != 0 {
+		t.Fatalf("upstream received %d requests, want 0", fx.upstream.count())
+	}
+}
+
+func TestOversizedLineIsSplitWithoutInventingNewlines(t *testing.T) {
+	// The chunk cap is the fix for "a long paste looks like the translator
+	// is unreachable": one over-long line becomes several bounded requests,
+	// and reassembly must not insert newlines that were never in the input.
+	var mu sync.Mutex
+	var sizes []int
+	fx := startFixture(t, gateway.Config{APIKey: "go-key", MaxChunkRunes: 10}, nil, func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Messages []struct {
+				Content string `json:"content"`
+			} `json:"messages"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if len(req.Messages) != 2 {
+			t.Errorf("messages = %+v", req.Messages)
+		}
+		piece := req.Messages[1].Content
+		mu.Lock()
+		sizes = append(sizes, len([]rune(piece)))
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"` + strings.Repeat("b", len([]rune(piece))) + `"},"finish_reason":"stop"}]}`))
+	})
+	// Distinct content per piece: identical pieces would be served from
+	// the hash cache and never reach the translator.
+	line := "第一段修复登录。第二段修复支付。第三段修复搜索。第四段修复上传。"
+	body := []byte(`{"model":"gpt-5.3-codex","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"` + line + `"}]}]}`)
+	resp := postJSON(t, fx.gateway.URL+"/v1/responses", "Bearer client-key", body)
+	raw, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d %s", resp.StatusCode, raw)
+	}
+	mu.Lock()
+	got := append([]int(nil), sizes...)
+	mu.Unlock()
+	// Requests arrive in whatever order the workers finish, so compare the
+	// multiset of sizes; the ORDER is pinned by the reassembled body below.
+	sort.Ints(got)
+	if fmt.Sprint(got) != fmt.Sprint([]int{2, 10, 10, 10}) {
+		t.Fatalf("piece sizes = %v, want the 32-rune line as 10+10+10+2", got)
+	}
+	joined := strings.Repeat("b", 32)
+	if !bytes.Contains(fx.upstream.lastBody(), []byte("Please reply in Chinese.\\n"+joined)) {
+		t.Fatalf("reassembled text missing or newline-split: %s", fx.upstream.lastBody())
+	}
+}
+
+func TestMimoKeyAloneIsEnoughToTranslate(t *testing.T) {
+	// The Xiaomi route carries its own credential: an empty OpenCode Go key
+	// must not silently forward Chinese untranslated (that bug also killed
+	// the panel blink, because no translator call ever started).
+	var xiaomiCalls int
+	xiaomi := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		xiaomiCalls++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"Fix it."},"finish_reason":"stop"}]}`))
+	}))
+	t.Cleanup(xiaomi.Close)
+	upstream := &recorded{}
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstream.add(r)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"up"}`))
+	}))
+	t.Cleanup(up.Close)
+	impl := gateway.New(gateway.Config{
+		Upstream:    up.URL,
+		APIKey:      "", // no OpenCode Go credential at all
+		Model:       "mimo-v2.5",
+		MimoAPIKey:  "mimo-test-key",
+		MimoBaseURL: xiaomi.URL,
+	})
+	srv := httptest.NewServer(impl)
+	t.Cleanup(srv.Close)
+	body := []byte(`{"model":"gpt-5.3-codex","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"修复一下。"}]}]}`)
+	resp := postJSON(t, srv.URL+"/v1/responses", "Bearer client-key", body)
+	if resp.StatusCode != http.StatusOK {
+		got, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status %d %s", resp.StatusCode, got)
+	}
+	if xiaomiCalls != 1 {
+		t.Fatalf("mimo calls = %d, want 1", xiaomiCalls)
+	}
+	if !bytes.Contains(upstream.lastBody(), []byte("Fix it.")) {
+		t.Fatalf("turn forwarded untranslated: %s", upstream.lastBody())
+	}
+}
+
+// ---- sizing round: tokens, splitting, parallelism, coverage --------------
+
+// englishMarker is a deterministic English "translation" of a chunk: no Han
+// (so it passes the post-check), derived from the content (so reassembly
+// order is verifiable), and cheap.
+func englishMarker(chunk string) string {
+	sum := sha256.Sum256([]byte(chunk))
+	return "T" + hex.EncodeToString(sum[:])[:12]
+}
+
+func writeChatTranslation(w http.ResponseWriter, text string) {
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write([]byte(`{"choices":[{"message":{"content":` + strconv.Quote(text) + `}}]}`))
+}
+
+// chunkOf pulls the user message out of a Chat Completions translation
+// request.
+func chunkOf(t *testing.T, body []byte) string {
+	t.Helper()
+	var in struct {
+		Messages []struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(body, &in); err != nil {
+		t.Fatalf("translator request is not JSON: %v", err)
+	}
+	for _, m := range in.Messages {
+		if m.Role == "user" {
+			return m.Content
+		}
+	}
+	return ""
+}
+
+func markerTranslator(t *testing.T) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		writeChatTranslation(w, englishMarker(chunkOf(t, mustReadAll(t, r))))
+	}
+}
+
+func mustReadAll(t *testing.T, r *http.Request) []byte {
+	t.Helper()
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		t.Fatalf("read translator request: %v", err)
+	}
+	_ = r.Body.Close()
+	return body
+}
+
+func userBody(text string) []byte {
+	raw, _ := json.Marshal(map[string]any{
+		"input": []any{map[string]any{
+			"role":    "user",
+			"content": []any{map[string]any{"type": "input_text", "text": text}},
+		}},
+	})
+	return raw
+}
+
+// TestChunkTokenCapBoundsTranslatorRequests raises the rune cap far above
+// what the backend can take: the token cap must still hold every request
+// inside the budget, and reassembly must stay exact.
+func TestChunkTokenCapBoundsTranslatorRequests(t *testing.T) {
+	const budget = 20
+	var text strings.Builder
+	for i := 0; i < 240; i++ {
+		text.WriteRune(rune(0x4E00 + i)) // 240 distinct Han runes
+	}
+	long := text.String()
+	var (
+		mu   sync.Mutex
+		seen []string
+	)
+	fx := startFixture(t, gateway.Config{
+		APIKey:         "k",
+		MaxChunkRunes:  100000,
+		MaxChunkTokens: budget,
+	}, nil, func(w http.ResponseWriter, r *http.Request) {
+		chunk := chunkOf(t, mustReadAll(t, r))
+		mu.Lock()
+		seen = append(seen, chunk)
+		mu.Unlock()
+		writeChatTranslation(w, englishMarker(chunk))
+	})
+	resp := postJSON(t, fx.gateway.URL+"/v1/responses", "", userBody(long))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d", resp.StatusCode)
+	}
+	mu.Lock()
+	pieces := append([]string(nil), seen...)
+	mu.Unlock()
+	if len(pieces) < 2 {
+		t.Fatalf("expected the text to be split, saw %d translator request(s)", len(pieces))
+	}
+	for i, chunk := range pieces {
+		if n := estimateApproxTokens(chunk); n > budget {
+			t.Fatalf("piece %d carries ~%d tokens, over the %d-token cap", i, n, budget)
+		}
+	}
+	// Pieces arrive in whatever order the workers finish, so rebuild the
+	// expectation from the text instead: every piece is exactly budget runes
+	// of distinct Han here, and the upstream body must hold them in order.
+	runes := []rune(long)
+	var reassembled strings.Builder
+	for i := 0; i < len(runes); i += budget {
+		end := i + budget
+		if end > len(runes) {
+			end = len(runes)
+		}
+		reassembled.WriteString(englishMarker(string(runes[i:end])))
+	}
+	if !strings.Contains(string(fx.upstream.lastBody()), reassembled.String()) {
+		t.Fatalf("upstream body is not the pieces concatenated in order: %s", fx.upstream.lastBody())
+	}
+}
+
+// estimateApproxTokens mirrors the gateway's own over-estimate (Han = 1
+// token, ASCII = 1/3) so the test can check the cap from outside the package.
+func estimateApproxTokens(s string) int {
+	ascii, wide := 0, 0
+	for _, r := range s {
+		if r < 128 {
+			ascii++
+			continue
+		}
+		wide++
+	}
+	return wide + (ascii+2)/3
+}
+
+// TestTranslatorTooLargeSplitsAndRetries is the answer to "the text does not
+// fit the translator": a size rejection must be repaired by splitting, not
+// escalated into a failed turn.
+func TestTranslatorTooLargeSplitsAndRetries(t *testing.T) {
+	const accepts = 40                      // runes the fake backend can take
+	line := strings.Repeat("这是一段很长的中文", 12) // 96 Han runes, one line
+	var calls int64
+	fx := startFixture(t, gateway.Config{APIKey: "k"}, nil, func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt64(&calls, 1)
+		chunk := chunkOf(t, mustReadAll(t, r))
+		if len([]rune(chunk)) > accepts {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":{"message":"This model's maximum context length is 8192 tokens","code":"context_length_exceeded"}}`))
+			return
+		}
+		writeChatTranslation(w, englishMarker(chunk))
+	})
+	resp := postJSON(t, fx.gateway.URL+"/v1/responses", "", userBody(line))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("a too-large piece must not fail the turn, status=%d", resp.StatusCode)
+	}
+	var want strings.Builder
+	for i := 0; i < len([]rune(line)); i += accepts {
+		if i > 0 {
+			want.WriteString("")
+		}
+	}
+	if got := atomic.LoadInt64(&calls); got < 2 {
+		t.Fatalf("expected a split and a retry, saw %d call(s)", got)
+	}
+	body := string(fx.upstream.lastBody())
+	if !strings.Contains(body, "T") {
+		t.Fatalf("upstream never received a translation: %s", body)
+	}
+	if hasHan(body) {
+		t.Fatal("the turn was forwarded with Han still in the live text")
+	}
+}
+
+// TestTranslatorTooLargeIsBounded makes sure the split-retry cannot turn one
+// rejection into hundreds of calls: past the depth limit the turn fails
+// closed with the size message instead of hammering the backend.
+func TestTranslatorTooLargeIsBounded(t *testing.T) {
+	var calls int64
+	fx := startFixture(t, gateway.Config{APIKey: "k"}, nil, func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt64(&calls, 1)
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":{"code":"context_length_exceeded"}}`))
+	})
+	resp := postJSON(t, fx.gateway.URL+"/v1/responses", "", userBody(strings.Repeat("中", 1500)))
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status=%d, want 403", resp.StatusCode)
+	}
+	msg, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(msg), "超出翻译服务的上下文") {
+		t.Fatalf("error does not name the size problem: %q", msg)
+	}
+	// 1 root + at most 2+4+8 leaves, and no fallback attempt on a size error.
+	total := atomic.LoadInt64(&calls)
+	if total > 15 {
+		t.Fatalf("split-retry storm: %d translator calls", total)
+	}
+	if total < 2 {
+		t.Fatalf("expected at least one split attempt, saw %d call(s)", total)
+	}
+}
+
+// TestPiecesRunInParallelAndKeepOrder pins both halves of the change: the
+// pieces of one message overlap in flight, and the reassembled body is still
+// in the original order.
+func TestPiecesRunInParallelAndKeepOrder(t *testing.T) {
+	const limit = 10
+	lines := []string{
+		"一二三四五六七八九十",
+		"甲乙丙丁戊己庚辛壬癸",
+		"子丑寅卯辰巳午未申酉",
+		"天地玄黄宇宙洪荒日月",
+	}
+	var (
+		mu       sync.Mutex
+		inFlight int
+		maxSeen  int
+		calls    int
+	)
+	fx := startFixture(t, gateway.Config{
+		APIKey:        "k",
+		MaxChunkRunes: limit,
+	}, nil, func(w http.ResponseWriter, r *http.Request) {
+		chunk := chunkOf(t, mustReadAll(t, r))
+		mu.Lock()
+		inFlight++
+		if inFlight > maxSeen {
+			maxSeen = inFlight
+		}
+		calls++
+		mu.Unlock()
+		time.Sleep(20 * time.Millisecond)
+		mu.Lock()
+		inFlight--
+		mu.Unlock()
+		writeChatTranslation(w, englishMarker(chunk))
+	})
+	resp := postJSON(t, fx.gateway.URL+"/v1/responses", "", userBody(strings.Join(lines, "\n")))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d", resp.StatusCode)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if maxSeen < 2 {
+		t.Fatalf("pieces never overlapped (max in flight %d)", maxSeen)
+	}
+	if calls != len(lines) {
+		t.Fatalf("translator calls=%d, want %d (one per piece)", calls, len(lines))
+	}
+	expected := make([]string, 0, len(lines))
+	for _, line := range lines {
+		expected = append(expected, englishMarker(line))
+	}
+	if !strings.Contains(string(fx.upstream.lastBody()), strings.Join(expected, `\n`)) {
+		t.Fatalf("pieces were reassembled out of order: %s", fx.upstream.lastBody())
+	}
+}
+
+// TestDuplicatePiecesTranslateOnce: the same text twice in one turn is one
+// translator call, not two.
+func TestDuplicatePiecesTranslateOnce(t *testing.T) {
+	const line = "重复的一行中文内容用来测试去重"
+	var calls int64
+	fx := startFixture(t, gateway.Config{APIKey: "k", MaxChunkRunes: 8}, nil, func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt64(&calls, 1)
+		chunk := chunkOf(t, mustReadAll(t, r))
+		writeChatTranslation(w, englishMarker(chunk))
+	})
+	resp := postJSON(t, fx.gateway.URL+"/v1/responses", "", userBody(line+"\n"+line))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d", resp.StatusCode)
+	}
+	unique := map[string]bool{}
+	runes := []rune(line)
+	for i := 0; i < len(runes); i += 8 {
+		end := i + 8
+		if end > len(runes) {
+			end = len(runes)
+		}
+		unique[englishMarker(string(runes[i:end]))] = true
+	}
+	if got := atomic.LoadInt64(&calls); got != int64(len(unique)) {
+		t.Fatalf("translator calls=%d, unique pieces=%d", got, len(unique))
+	}
+}
+
+// TestAngleBracketsSurviveRewriting: json.Marshal's HTML escaping used to
+// turn every < into \u003c, which is both a different document and more
+// tokens in a context window that is already tight.
+func TestAngleBracketsSurviveRewriting(t *testing.T) {
+	fx := startFixture(t, gateway.Config{APIKey: "k"}, nil, markerTranslator(t))
+	// The instructions ride along untranslated, so they are the field that
+	// shows whether the re-encoding escaped HTML. The user text forces the
+	// rewrite (Han translation) that used to escape the whole document.
+	raw, _ := json.Marshal(map[string]any{
+		"instructions": "always use <div class=\"x\"> and <span>, never &amp;",
+		"input": []any{map[string]any{
+			"role":    "user",
+			"content": []any{map[string]any{"type": "input_text", "text": "把这段中文翻译一下"}},
+		}},
+	})
+	resp := postJSON(t, fx.gateway.URL+"/v1/responses", "", raw)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d", resp.StatusCode)
+	}
+	body := string(fx.upstream.lastBody())
+	if !strings.Contains(body, "<div") || !strings.Contains(body, "<span>") || !strings.Contains(body, "&amp;") {
+		t.Fatalf("markup was rewritten: %s", body)
+	}
+	if strings.Contains(body, `\u003c`) || strings.Contains(body, `\u0026`) {
+		t.Fatalf("payload is still HTML-escaped: %s", body)
+	}
+	if !strings.Contains(body, "T") {
+		t.Fatalf("the Han text was never translated: %s", body)
+	}
+}
+
+// chatHistoryBody is a Responses-shaped turn with oldest-first messages, the
+// way Codex replays a session.
+func chatHistoryBody(texts ...string) []byte {
+	items := make([]any, 0, len(texts))
+	for i, text := range texts {
+		role := "assistant"
+		if i%2 == 1 || i == len(texts)-1 {
+			role = "user"
+		}
+		items = append(items, map[string]any{
+			"role":    role,
+			"content": []any{map[string]any{"type": "input_text", "text": text}},
+		})
+	}
+	raw, _ := json.Marshal(map[string]any{"input": items})
+	return raw
+}
+
+// TestCoverageKeepsTheLiveTurnWhenTranslationWouldOverflow is the answer to
+// "the Chinese fits, the English does not": the newest text is still
+// translated, the oldest are left in Chinese, and the turn goes through.
+func TestCoverageKeepsTheLiveTurnWhenTranslationWouldOverflow(t *testing.T) {
+	old1, old2 := hanN(400), hanN(400)
+	live := hanN(100)
+	body := chatHistoryBody(old1, old2, live)
+
+	// Place the window between the untranslated and the translated size of
+	// this exact request, so only a coverage decision can save it.
+	original := estTokens(string(body)) + estTokens(replyInstruction)
+	target := original + (estTokens(old1)+estTokens(old2)+estTokens(live))*25/100/2
+
+	var (
+		mu    sync.Mutex
+		calls []string
+	)
+	fx := startFixture(t, gateway.Config{
+		APIKey:                "k",
+		UpstreamContextTokens: target * 100 / 90,
+	}, nil, func(w http.ResponseWriter, r *http.Request) {
+		chunk := chunkOf(t, mustReadAll(t, r))
+		mu.Lock()
+		calls = append(calls, chunk)
+		mu.Unlock()
+		writeChatTranslation(w, englishMarker(chunk))
+	})
+	resp := postJSON(t, fx.gateway.URL+"/v1/responses", "", body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d", resp.StatusCode)
+	}
+	upstream := string(fx.upstream.lastBody())
+	if !strings.Contains(upstream, englishMarker(live)) {
+		t.Fatalf("the live turn must be translated: %s", upstream)
+	}
+	if !strings.Contains(upstream, old1) || !strings.Contains(upstream, old2) {
+		t.Fatalf("older history must ride along in Chinese, not vanish: %s", upstream)
+	}
+	mu.Lock()
+	called := len(calls)
+	mu.Unlock()
+	if called != 1 {
+		t.Fatalf("translator calls=%d, want 1 (only the live turn)", called)
+	}
+	if got := fx.impl.Metrics().ContextBudgetSkips; got != 2 {
+		t.Fatalf("contextBudgetSkips=%d, want 2", got)
+	}
+}
+
+// TestCoverageOffByDefault: without a configured window nothing is skipped —
+// the check must never surprise a user who left the field at 0.
+func TestCoverageOffByDefault(t *testing.T) {
+	fx := startFixture(t, gateway.Config{APIKey: "k"}, nil, markerTranslator(t))
+	resp := postJSON(t, fx.gateway.URL+"/v1/responses", "", chatHistoryBody(hanN(400), hanN(401), hanN(402)))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d", resp.StatusCode)
+	}
+	if fx.translator.count() != 3 {
+		t.Fatalf("translator calls=%d, want 3", fx.translator.count())
+	}
+	if got := fx.impl.Metrics().ContextBudgetSkips; got != 0 {
+		t.Fatalf("contextBudgetSkips=%d, want 0", got)
+	}
+}
+
+// TestCoverageTranslatesEverythingWhenTranslationIsNotTheCause: a request
+// that is already over the window gets translated as usual, because dropping
+// translation would not make it fit.
+func TestCoverageTranslatesEverythingWhenTranslationIsNotTheCause(t *testing.T) {
+	body := chatHistoryBody(hanN(800), hanN(801), hanN(200))
+	fx := startFixture(t, gateway.Config{
+		APIKey:                "k",
+		UpstreamContextTokens: 1000, // far below the body's own estimate
+	}, nil, markerTranslator(t))
+	resp := postJSON(t, fx.gateway.URL+"/v1/responses", "", body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d", resp.StatusCode)
+	}
+	if fx.translator.count() != 3 {
+		t.Fatalf("translator calls=%d, want 3 (degrading would not help)", fx.translator.count())
+	}
+	if got := fx.impl.Metrics().ContextBudgetSkips; got != 0 {
+		t.Fatalf("contextBudgetSkips=%d, want 0", got)
+	}
+}
+
+// TestTranslateCacheIsBounded: the cache may forget the oldest entries (a
+// re-translation at worst), but it must not grow without bound in a long
+// session, because the whole file is rewritten on every debounce.
+func TestTranslateCacheIsBounded(t *testing.T) {
+	fx := startFixture(t, gateway.Config{APIKey: "k", MaxCacheEntries: 2}, nil, markerTranslator(t))
+	first, second, third := hanN(60), hanN(61), hanN(62)
+	for _, text := range []string{first, second, third} {
+		if resp := postJSON(t, fx.gateway.URL+"/v1/responses", "", userBody(text)); resp.StatusCode != http.StatusOK {
+			t.Fatalf("status=%d", resp.StatusCode)
+		}
+	}
+	after := fx.translator.count()
+	if after != 3 {
+		t.Fatalf("expected 3 calls for 3 new texts, got %d", after)
+	}
+	// Eviction is oldest-inserted-first: after three insertions the first is
+	// gone, so it costs a call again (and re-inserts itself, pushing the
+	// second out in turn).
+	if resp := postJSON(t, fx.gateway.URL+"/v1/responses", "", userBody(first)); resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d", resp.StatusCode)
+	}
+	if fx.translator.count() != after+1 {
+		t.Fatalf("evicted entry was not re-translated: %d", fx.translator.count())
+	}
+	// The newest entry is still cached.
+	if resp := postJSON(t, fx.gateway.URL+"/v1/responses", "", userBody(third)); resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d", resp.StatusCode)
+	}
+	if fx.translator.count() != after+1 {
+		t.Fatalf("a cached entry was translated again: %d", fx.translator.count())
+	}
+	// The middle one was the next-oldest, so it went out with the re-insert.
+	if resp := postJSON(t, fx.gateway.URL+"/v1/responses", "", userBody(second)); resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d", resp.StatusCode)
+	}
+	if fx.translator.count() != after+2 {
+		t.Fatalf("oldest-inserted eviction is not FIFO: %d calls", fx.translator.count())
+	}
+}
+
+// hanN returns n Han runes, each estimating as one token.
+func hanN(n int) string { return strings.Repeat("中", n) }
+
+// estTokens mirrors the gateway's own over-estimate so a test can place a
+// budget between "as written" and "as translated" without exporting it.
+func estTokens(s string) int {
+	ascii, wide, other := 0, 0, 0
+	for _, r := range s {
+		switch {
+		case r < 128:
+			ascii++
+		case unicode.In(r, unicode.Han, unicode.Hiragana, unicode.Katakana, unicode.Hangul):
+			wide++
+		default:
+			other++
+		}
+	}
+	return wide + (ascii+2)/3 + (other+1)/2
 }

@@ -1,13 +1,8 @@
-//go:build linux
-
 package tray
 
-import (
-	"testing"
-	"time"
-)
+import "testing"
 
-// samplePoint sits inside the accent square but outside both backdrop cuts
+// sampleAccent sits inside the accent square but outside both backdrop cuts
 // for the 32px render.
 func sampleAccent(size int, ok bool) (uint8, uint8, uint8) {
 	w, h, pix := IconPixmapFor(size, ok)
@@ -16,6 +11,16 @@ func sampleAccent(size int, ok bool) (uint8, uint8, uint8) {
 	}
 	x, y := size*11/16, size*10/16
 	off := (y*size + x) * 4
+	return pix[off+1], pix[off+2], pix[off+3]
+}
+
+func sampleAccentDim(ok bool) (uint8, uint8, uint8) {
+	w, h, pix := IconPixmapDimFor(32, ok)
+	if int(w) != 32 || int(h) != 32 {
+		panic("bad size")
+	}
+	x, y := 32*11/16, 32*10/16
+	off := (y*32 + x) * 4
 	return pix[off+1], pix[off+2], pix[off+3]
 }
 
@@ -34,7 +39,7 @@ func TestStatusIconsDiffer(t *testing.T) {
 }
 
 func TestDimDiffersFromBoth(t *testing.T) {
-	dr, dg, db := sampleAccentDim()
+	dr, dg, db := sampleAccentDim(true)
 	gr, gg, gb := sampleAccent(32, true)
 	rr, rg, rb := sampleAccent(32, false)
 	if (dr == gr && dg == gg && db == gb) || (dr == rr && dg == rg && db == rb) {
@@ -45,35 +50,20 @@ func TestDimDiffersFromBoth(t *testing.T) {
 	}
 }
 
-func sampleAccentDim() (uint8, uint8, uint8) {
-	w, h, pix := IconPixmapDim(32)
-	if int(w) != 32 || int(h) != 32 {
-		panic("bad size")
+func TestDimFaultKeepsTheFaultHue(t *testing.T) {
+	// A red icon must blink red-dim, not green: the blink is decoupled from
+	// health, but the colour still has to tell the truth.
+	dr, dg, db := sampleAccentDim(false)
+	fr, fg, fb := sampleAccent(32, false)
+	if dr > 150 || dg > 80 || db > 80 {
+		t.Fatalf("dim fault not dark red: %d %d %d", dr, dg, db)
 	}
-	x, y := 32*11/16, 32*10/16
-	off := (y*32 + x) * 4
-	return pix[off+1], pix[off+2], pix[off+3]
-}
-
-func TestBlinkHoldWindow(t *testing.T) {
-	now := time.Now()
-	if blinkDim(false, true, now, now) {
-		t.Fatal("fault must stay steady red")
+	if dr == fr && dg == fg && db == fb {
+		t.Fatal("dim fault equals the steady fault colour")
 	}
-	if blinkDim(true, true, time.Time{}, now) {
-		t.Fatal("never-active must not blink")
-	}
-	if !blinkDim(true, true, now, now) {
-		t.Fatal("active translating must show dim on phase")
-	}
-	if blinkDim(true, false, now, now) {
-		t.Fatal("off phase must show steady green")
-	}
-	if !blinkDim(true, true, now.Add(-4*time.Second), now) {
-		t.Fatal("hold window must still blink")
-	}
-	if blinkDim(true, true, now.Add(-6*time.Second), now) {
-		t.Fatal("expired hold must stop blinking")
+	_, gg, _ := sampleAccent(32, true)
+	if dg > gg {
+		t.Fatalf("dim fault looks greener (%d) than healthy green (%d)", dg, gg)
 	}
 }
 
@@ -82,5 +72,11 @@ func TestLegacyIconUnchanged(t *testing.T) {
 	w2, h2, p2 := IconPixmapFor(32, true)
 	if w1 != w2 || h1 != h2 || string(p1) != string(p2) {
 		t.Fatal("IconPixmap changed meaning")
+	}
+	// IconPixmapDim keeps rendering the healthy dim phase.
+	w3, h3, p3 := IconPixmapDim(32)
+	w4, h4, p4 := IconPixmapDimFor(32, true)
+	if w3 != w4 || h3 != h4 || string(p3) != string(p4) {
+		t.Fatal("IconPixmapDim changed meaning")
 	}
 }

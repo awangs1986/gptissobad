@@ -349,3 +349,47 @@ func TestEnableGatewayMovesOffOccupiedCodexPort(t *testing.T) {
 		t.Fatalf("gateway stayed on occupied Codex port %s", port)
 	}
 }
+
+func TestUpstreamContextTokensRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	rt := control.New(control.Paths{Dir: dir, PiAuthFile: filepath.Join(dir, "auth.json")})
+	if got := rt.State().UpstreamContextTokens; got != 0 {
+		t.Fatalf("default = %d, want 0 (check off)", got)
+	}
+	n := 128000
+	if err := rt.UpdateConfig(control.ConfigInput{UpstreamContextTokens: &n}); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+	if got := rt.State().UpstreamContextTokens; got != n {
+		t.Fatalf("state = %d, want %d", got, n)
+	}
+	// A reload must keep it: it is persisted with the rest of the settings.
+	again := control.New(control.Paths{Dir: dir, PiAuthFile: filepath.Join(dir, "auth.json")})
+	if got := again.State().UpstreamContextTokens; got != n {
+		t.Fatalf("after reload = %d, want %d", got, n)
+	}
+	// 0 turns the check off again.
+	zero := 0
+	if err := again.UpdateConfig(control.ConfigInput{UpstreamContextTokens: &zero}); err != nil {
+		t.Fatalf("disable: %v", err)
+	}
+	if got := again.State().UpstreamContextTokens; got != 0 {
+		t.Fatalf("after disable = %d, want 0", got)
+	}
+	// Absent field means "unchanged", not "reset".
+	if err := again.UpdateConfig(control.ConfigInput{UpstreamContextTokens: &n}); err != nil {
+		t.Fatalf("re-set: %v", err)
+	}
+	if err := again.UpdateConfig(control.ConfigInput{Model: "mimo-v2.5"}); err != nil {
+		t.Fatalf("other update: %v", err)
+	}
+	if got := again.State().UpstreamContextTokens; got != n {
+		t.Fatalf("unrelated update cleared it: %d", got)
+	}
+	// Typos are rejected instead of silently disabling the guard.
+	for _, bad := range []int{1, -5, 2000001} {
+		if err := again.UpdateConfig(control.ConfigInput{UpstreamContextTokens: &bad}); err == nil {
+			t.Fatalf("%d should be rejected", bad)
+		}
+	}
+}
