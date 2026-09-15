@@ -37,19 +37,25 @@ const (
 	// frontPortReleaseWait bounds how long we wait for a signalled front to
 	// release its port before giving up and reporting the port unusable.
 	frontPortReleaseWait = 2 * time.Second
+	// maxContextTokens bounds the Control Page's upstream-context field:
+	// anything past this is a typo, not a model.
+	maxContextTokens = 2000000
 )
 
 type Settings struct {
-	Enabled           bool   `json:"enabled"`
-	UIPort            string `json:"uiPort"`
-	GatewayPort       string `json:"gatewayPort"`
-	Upstream          string `json:"upstream"`
-	Model             string `json:"model"`
-	FallbackModel     string `json:"fallbackModel"`
-	FrontEnabled      bool   `json:"frontEnabled"`
-	FrontPort         string `json:"frontPort"`
-	BasePath          string `json:"basePath"`
-	DirectGatewayPort string `json:"directGatewayPort,omitempty"`
+	Enabled       bool   `json:"enabled"`
+	UIPort        string `json:"uiPort"`
+	GatewayPort   string `json:"gatewayPort"`
+	Upstream      string `json:"upstream"`
+	Model         string `json:"model"`
+	FallbackModel string `json:"fallbackModel"`
+	// UpstreamContextTokens is the upstream model's context window in
+	// tokens; 0 (default) disables the gateway's coverage check.
+	UpstreamContextTokens int    `json:"upstreamContextTokens"`
+	FrontEnabled          bool   `json:"frontEnabled"`
+	FrontPort             string `json:"frontPort"`
+	BasePath              string `json:"basePath"`
+	DirectGatewayPort     string `json:"directGatewayPort,omitempty"`
 }
 
 type Paths struct {
@@ -235,26 +241,27 @@ func (r *Runtime) waitLogs(seq int) <-chan struct{} {
 }
 
 type State struct {
-	Enabled        bool            `json:"enabled"`
-	Running        bool            `json:"running"`
-	Listen         string          `json:"listen"`
-	FrontListen    string          `json:"frontListen,omitempty"`
-	UIListen       string          `json:"uiListen"`
-	Upstream       string          `json:"upstream"`
-	GatewayPort    string          `json:"gatewayPort"`
-	UIPort         string          `json:"uiPort"`
-	Model          string          `json:"model"`
-	FallbackModel  string          `json:"fallbackModel"`
-	FrontEnabled   bool            `json:"frontEnabled"`
-	FrontPort      string          `json:"frontPort"`
-	BasePath       string          `json:"basePath"`
-	HasKey         bool            `json:"hasKey"`
-	FrontReachable bool            `json:"frontReachable"`
-	Translating    bool            `json:"translating"`
-	TOML           string          `json:"toml"`
-	Error          string          `json:"error,omitempty"`
-	Metrics        gateway.Metrics `json:"metrics"`
-	KeySource      string          `json:"credentialSource"`
+	Enabled               bool            `json:"enabled"`
+	Running               bool            `json:"running"`
+	Listen                string          `json:"listen"`
+	FrontListen           string          `json:"frontListen,omitempty"`
+	UIListen              string          `json:"uiListen"`
+	Upstream              string          `json:"upstream"`
+	GatewayPort           string          `json:"gatewayPort"`
+	UIPort                string          `json:"uiPort"`
+	Model                 string          `json:"model"`
+	FallbackModel         string          `json:"fallbackModel"`
+	UpstreamContextTokens int             `json:"upstreamContextTokens"`
+	FrontEnabled          bool            `json:"frontEnabled"`
+	FrontPort             string          `json:"frontPort"`
+	BasePath              string          `json:"basePath"`
+	HasKey                bool            `json:"hasKey"`
+	FrontReachable        bool            `json:"frontReachable"`
+	Translating           bool            `json:"translating"`
+	TOML                  string          `json:"toml"`
+	Error                 string          `json:"error,omitempty"`
+	Metrics               gateway.Metrics `json:"metrics"`
+	KeySource             string          `json:"credentialSource"`
 }
 
 func (r *Runtime) State() State {
@@ -281,25 +288,26 @@ func (r *Runtime) stateLocked() State {
 		frontListen = net.JoinHostPort("127.0.0.1", r.settings.FrontPort)
 	}
 	return State{
-		Enabled:        r.settings.Enabled,
-		Running:        r.listener != nil,
-		Listen:         net.JoinHostPort("127.0.0.1", listenPort),
-		FrontListen:    frontListen,
-		UIListen:       net.JoinHostPort("127.0.0.1", r.settings.UIPort),
-		Upstream:       r.settings.Upstream,
-		GatewayPort:    r.settings.GatewayPort,
-		UIPort:         r.settings.UIPort,
-		Model:          r.settings.Model,
-		FallbackModel:  r.settings.FallbackModel,
-		FrontEnabled:   r.settings.FrontEnabled,
-		FrontPort:      r.settings.FrontPort,
-		BasePath:       r.settings.BasePath,
-		HasKey:         key != "",
-		FrontReachable: r.frontReachableLocked(),
-		Translating:    metrics.Translating,
-		KeySource:      keySource,
-		TOML:           gateway.ConfigTOMLFor(tomlPort, r.settings.BasePath),
-		Metrics:        metrics,
+		Enabled:               r.settings.Enabled,
+		Running:               r.listener != nil,
+		Listen:                net.JoinHostPort("127.0.0.1", listenPort),
+		FrontListen:           frontListen,
+		UIListen:              net.JoinHostPort("127.0.0.1", r.settings.UIPort),
+		Upstream:              r.settings.Upstream,
+		GatewayPort:           r.settings.GatewayPort,
+		UIPort:                r.settings.UIPort,
+		Model:                 r.settings.Model,
+		FallbackModel:         r.settings.FallbackModel,
+		UpstreamContextTokens: r.settings.UpstreamContextTokens,
+		FrontEnabled:          r.settings.FrontEnabled,
+		FrontPort:             r.settings.FrontPort,
+		BasePath:              r.settings.BasePath,
+		HasKey:                key != "",
+		FrontReachable:        r.frontReachableLocked(),
+		Translating:           metrics.Translating,
+		KeySource:             keySource,
+		TOML:                  gateway.ConfigTOMLFor(tomlPort, r.settings.BasePath),
+		Metrics:               metrics,
 	}
 }
 
@@ -310,8 +318,10 @@ type ConfigInput struct {
 	Model         string `json:"model"`
 	FallbackModel string `json:"fallbackModel"`
 	APIKey        string `json:"apiKey"`
-	FrontPort     string `json:"frontPort"`
-	BasePath      string `json:"basePath"`
+	// Pointer so 0 (disable) differs from "field not sent".
+	UpstreamContextTokens *int   `json:"upstreamContextTokens"`
+	FrontPort             string `json:"frontPort"`
+	BasePath              string `json:"basePath"`
 }
 
 func (r *Runtime) UpdateConfig(in ConfigInput) error {
@@ -344,6 +354,13 @@ func (r *Runtime) UpdateConfig(in ConfigInput) error {
 		} else {
 			r.settings.FallbackModel = f
 		}
+	}
+	if in.UpstreamContextTokens != nil {
+		n := *in.UpstreamContextTokens
+		if n != 0 && (n < 1000 || n > maxContextTokens) {
+			return fmt.Errorf("上游上下文上限要填 0（关闭）或 1000–%d 之间的整数", maxContextTokens)
+		}
+		r.settings.UpstreamContextTokens = n
 	}
 	if p := strings.TrimSpace(in.FrontPort); p != "" {
 		if err := validPort(p); err != nil {
@@ -579,12 +596,13 @@ func (r *Runtime) startLocked() error {
 	}
 	key, _ := r.readKey()
 	gw := gateway.New(gateway.Config{
-		Upstream:      upstream,
-		APIKey:        key,
-		Model:         r.settings.Model,
-		FallbackModel: r.settings.FallbackModel,
-		CacheFile:     r.paths.translateCacheFile(),
-		Log:           r.Log,
+		Upstream:              upstream,
+		APIKey:                key,
+		Model:                 r.settings.Model,
+		FallbackModel:         r.settings.FallbackModel,
+		UpstreamContextTokens: r.settings.UpstreamContextTokens,
+		CacheFile:             r.paths.translateCacheFile(),
+		Log:                   r.Log,
 	})
 	r.listener = ln
 	r.gateway = gw

@@ -31,14 +31,29 @@ const (
 	// DefaultMaxChunkRunes caps how much text one translator request
 	// carries. Bigger inputs are split at line boundaries (never dropped).
 	DefaultMaxChunkRunes = 1500
-	sessionTTL           = 30 * time.Minute
-	maxSessions          = 1000
-	strategyVersion      = "1"
-	failClosedMsg        = "翻译失败，这一轮未发送"
-	failClosedStatus     = http.StatusForbidden
-	quotaMsg             = "翻译额度用尽，这一轮未发送"
-	translatorHanMsg     = "Translator Backend 返回的仍是中文，这一轮未发送"
-	translatorTruncMsg   = "翻译结果被截断，这一轮未发送"
+	// DefaultMaxChunkTokens is the second, independent cap on one translator
+	// request: estimated tokens. The rune cap alone cannot promise that a
+	// piece fits the backend's window once MaxChunkRunes is raised, or when
+	// the text is not Han (kana, Hangul and emoji cost about a token per
+	// rune, not per three).
+	DefaultMaxChunkTokens = 2000
+	// translateWorkers bounds how many translator requests one turn keeps in
+	// flight. Pieces are independent, so translating them one after another
+	// multiplied a long paste's latency by its piece count; four is enough
+	// to hide the round-trips without tripping a shared-endpoint rate limit.
+	translateWorkers   = 4
+	sessionTTL         = 30 * time.Minute
+	maxSessions        = 1000
+	strategyVersion    = "1"
+	failClosedMsg      = "翻译失败，这一轮未发送"
+	failClosedStatus   = http.StatusForbidden
+	quotaMsg           = "翻译额度用尽，这一轮未发送"
+	translatorHanMsg   = "Translator Backend 返回的仍是中文，这一轮未发送"
+	translatorTruncMsg = "翻译结果被截断，这一轮未发送"
+	// translatorTooLargeMsg is for a translator that refuses a piece even
+	// after the gateway split it down to a few hundred runes: that is a
+	// configuration problem (wrong window/model), not a long prompt.
+	translatorTooLargeMsg = "文本超出翻译服务的上下文，这一轮未发送"
 	// maxOutputTokensCap bounds the max_tokens we ask for: translation
 	// output is comparable to input, so the cap scales with the chunk.
 	maxOutputTokensCap = 16384
@@ -87,9 +102,25 @@ type Config struct {
 	// zero means DefaultMaxChunkRunes. Oversized text is split at line
 	// boundaries and reassembled, never dropped.
 	MaxChunkRunes int
+	// MaxChunkTokens caps the estimated tokens of one translator request;
+	// zero means DefaultMaxChunkTokens. Whichever of the two caps bites
+	// first wins, so raising MaxChunkRunes cannot push a piece past the
+	// backend's context window.
+	MaxChunkTokens int
+	// UpstreamContextTokens is the upstream model's context window, in
+	// tokens; zero (the default) disables the check. When set, the gateway
+	// estimates the request as it would look translated and, if translation
+	// is what would push it over, stops translating from the OLDEST text
+	// first: the live turn stays translated, old history rides along in
+	// Chinese (policy §0/§3) instead of the upstream rejecting the turn.
+	UpstreamContextTokens int
 	// CacheFile is the on-disk Translate Cache (hash → Translated Prompt).
 	// Empty means memory only. The file never stores the User Prompt.
 	CacheFile string
+	// MaxCacheEntries bounds the Translate Cache; zero means
+	// maxCacheEntries. Oldest-inserted entries are dropped first, which
+	// costs a re-translation at worst and never correctness.
+	MaxCacheEntries int
 	// CacheReadOnly loads the cache file at startup but never writes it.
 	// Only the Watchdog gateway may persist; codex-translate runs read-only
 	// so two processes never clobber each other's full-map snapshots.
@@ -105,6 +136,7 @@ type Gateway struct {
 	sessionID   string
 	cacheMu     sync.Mutex
 	cache       map[string]string
+	cacheOrder  []string
 	cacheDirty  bool
 	cacheTimer  *time.Timer
 	translating atomic.Int64
@@ -136,6 +168,11 @@ type Metrics struct {
 	CompletionTokens    uint64 `json:"completionTokens"`
 	TotalTokens         uint64 `json:"totalTokens"`
 	FallbackRequests    uint64 `json:"fallbackRequests"`
+	// ContextBudgetSkips counts translatable texts left in their original
+	// language because translating them would have pushed the request past
+	// Config.UpstreamContextTokens. Non-zero here is the gateway choosing a
+	// readable turn over a rejected one, never a leak.
+	ContextBudgetSkips uint64 `json:"contextBudgetSkips"`
 	// Translating reports live in-flight translator calls. Best effort:
 	// short calls may start and finish between two polls.
 	Translating bool `json:"translating"`
@@ -160,6 +197,12 @@ func New(cfg Config) *Gateway {
 	}
 	if cfg.MaxChunkRunes <= 0 {
 		cfg.MaxChunkRunes = DefaultMaxChunkRunes
+	}
+	if cfg.MaxChunkTokens <= 0 {
+		cfg.MaxChunkTokens = DefaultMaxChunkTokens
+	}
+	if cfg.UpstreamContextTokens < 0 {
+		cfg.UpstreamContextTokens = 0
 	}
 	if cfg.Model == "" {
 		cfg.Model = "mimo-v2.5"
@@ -331,6 +374,20 @@ func (g *Gateway) logFailClosed(method, path string, err error) {
 // timeoutFor scales the base timeout with the chunk size: a max-size chunk
 // gets up to 2× the base, so raising MaxChunkRunes cannot reintroduce the
 // "long prompt looks unreachable" timeout.
+// logCoverage says out loud when the upstream budget changed the turn: a
+// silent skip would look exactly like "the translator did nothing".
+func (g *Gateway) logCoverage(plan coveragePlan) {
+	switch {
+	case plan.overBudgetInput:
+		g.logf("context budget: request is already ~%d tokens with a %d-token upstream budget; translation is not the cause, translating normally",
+			plan.estimated, plan.budget)
+	case plan.skipped > 0:
+		g.metric(func(m *Metrics) { m.ContextBudgetSkips += uint64(plan.skipped) })
+		g.logf("context budget: translated request would be ~%d tokens (budget %d); oldest %d text(s) left in Chinese so the turn still fits",
+			plan.estimated, plan.budget, plan.skipped)
+	}
+}
+
 func (g *Gateway) timeoutFor(chunk string) time.Duration {
 	base := g.cfg.TranslateTimeout
 	if base <= 0 {
@@ -355,7 +412,9 @@ func (g *Gateway) timeoutFor(chunk string) time.Duration {
 // more. Without an explicit cap a cut-off answer used to be forwarded as a
 // half-translated prompt; now truncation is detected and fails closed.
 func maxOutputTokensFor(chunk string) int {
-	n := len([]rune(chunk)) * 2
+	// Output tokens track input tokens, not runes: a dense Chinese chunk is
+	// about a token per rune either way, but mixed text is not.
+	n := estimateTokens(chunk) * 2
 	if n < 1024 {
 		n = 1024
 	}
@@ -460,8 +519,24 @@ func (g *Gateway) rewrite(ctx context.Context, body []byte, headers http.Header)
 	} else {
 		g.metric(func(m *Metrics) { m.FullRebuilds++ })
 	}
+	// Decide how much of the turn can be translated before spending anything:
+	// with an upstream window configured, a request whose English version
+	// would not fit is trimmed from the OLDEST text first, so the live turn
+	// is always the part that gets translated.
+	plan := g.planCoverage(body, collectTranslatableTexts(payload), working.translations)
+	if plan.enabled {
+		g.logCoverage(plan)
+	}
 	changed := false
+	at := 0
 	err := walkTranslatableTexts(payload, func(text string) (string, error) {
+		i := at
+		at++
+		if i < len(plan.allowed) && !plan.allowed[i] {
+			// Budget-skipped: the original rides through untouched, exactly
+			// like the other policy-sanctioned untranslated texts.
+			return text, nil
+		}
 		out, did, err := g.translateTextWithCache(ctx, text, working.translations, true)
 		if err != nil {
 			return "", err
@@ -476,7 +551,7 @@ func (g *Gateway) rewrite(ctx context.Context, body []byte, headers http.Header)
 	}
 	g.commitSession(key, working)
 	prependReplyInstruction(payload)
-	out, err := json.Marshal(payload)
+	out, err := marshalPayload(payload)
 	if err != nil {
 		return nil, false, errors.New(failClosedMsg)
 	}
@@ -688,30 +763,16 @@ func (g *Gateway) translateTextWithCache(ctx context.Context, text string, sessi
 	if !needTranslate {
 		return text, false, nil
 	}
+	outs, err := g.translatePieces(ctx, pieces, sessionCache, allowGlobalCache)
+	if err != nil {
+		return "", false, err
+	}
 	var b strings.Builder
-	started := false
-	for _, p := range pieces {
-		out := p.text
-		if !p.secret && hasHan(p.text) {
-			key := g.cacheKey(p.text)
-			cached, ok := sessionCache[key]
-			if !ok {
-				var err error
-				cached, err = g.translateChunkCached(ctx, p.text, allowGlobalCache)
-				if err != nil {
-					return "", false, err
-				}
-				if sessionCache != nil {
-					sessionCache[key] = cached
-				}
-			}
-			out = cached
-		}
-		if started {
-			b.WriteString(p.sep)
+	for i, out := range outs {
+		if i > 0 {
+			b.WriteString(pieces[i].sep)
 		}
 		b.WriteString(out)
-		started = true
 	}
 	joined := b.String()
 	if len(heldPaths) > 0 {
@@ -723,6 +784,152 @@ func (g *Gateway) translateTextWithCache(ctx context.Context, text string, sessi
 		joined = restored
 	}
 	return joined, true, nil
+}
+
+// translatePieces translates every Han-bearing, non-secret piece and returns
+// one output per piece in piece order. The pieces of one text are
+// independent, so they go through a small worker pool instead of queueing one
+// translator round-trip behind another; identical pieces (a repeated line, the
+// same file pasted twice) are translated once and share the answer. The first
+// failure cancels the siblings — the turn fails closed either way, and there
+// is no point paying for the rest of a broken turn.
+func (g *Gateway) translatePieces(ctx context.Context, pieces []chunkPiece, sessionCache map[string]string, allowGlobalCache bool) ([]string, error) {
+	outs := make([]string, len(pieces))
+	type job struct {
+		text string
+		outs []int
+	}
+	var jobs []*job
+	index := make(map[string]*job, len(pieces))
+	for i, p := range pieces {
+		outs[i] = p.text
+		if p.secret || !hasHan(p.text) {
+			continue
+		}
+		if sessionCache != nil {
+			if cached, ok := sessionCache[g.cacheKey(p.text)]; ok {
+				outs[i] = cached
+				continue
+			}
+		}
+		j, ok := index[p.text]
+		if !ok {
+			j = &job{text: p.text}
+			index[p.text] = j
+			jobs = append(jobs, j)
+		}
+		j.outs = append(j.outs, i)
+	}
+	if len(jobs) == 0 {
+		return outs, nil
+	}
+
+	results := make([]string, len(jobs))
+	errs := make([]error, len(jobs))
+	workers := translateWorkers
+	if workers > len(jobs) {
+		workers = len(jobs)
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var (
+		mu   sync.Mutex
+		next int
+		wg   sync.WaitGroup
+	)
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				mu.Lock()
+				i := next
+				next++
+				mu.Unlock()
+				if i >= len(jobs) {
+					return
+				}
+				out, err := g.translatePieceAdaptive(ctx, chunkPiece{text: jobs[i].text}, allowGlobalCache)
+				if err != nil {
+					errs[i] = err
+					cancel()
+					return
+				}
+				results[i] = out
+			}
+		}()
+	}
+	wg.Wait()
+	if err := firstPieceErr(errs); err != nil {
+		return nil, err
+	}
+	// Cache writes happen here, after the pool is gone: the session map is
+	// per-request state and stays lock-free.
+	for i, j := range jobs {
+		for _, at := range j.outs {
+			outs[at] = results[i]
+		}
+		if sessionCache != nil {
+			sessionCache[g.cacheKey(j.text)] = results[i]
+		}
+	}
+	return outs, nil
+}
+
+// firstPieceErr picks the failure to report. Cancellation is an artifact of
+// its sibling failing first, so a real error always wins over a canceled one;
+// within either kind the earliest piece wins so the message is stable.
+func firstPieceErr(errs []error) error {
+	var canceled error
+	for _, err := range errs {
+		if err == nil {
+			continue
+		}
+		if failureClass(err) == "canceled" {
+			if canceled == nil {
+				canceled = err
+			}
+			continue
+		}
+		return err
+	}
+	return canceled
+}
+
+// translatePieceAdaptive translates one piece and, when the backend answers
+// that the request did not fit, splits it and retries the halves. This is the
+// answer to "the text does not fit the translator": the gateway makes it fit
+// instead of failing the turn. Splitting is bounded by maxSplitDepth, below
+// which the refusal is a configuration problem and the error stands.
+func (g *Gateway) translatePieceAdaptive(ctx context.Context, p chunkPiece, allowGlobalCache bool) (string, error) {
+	return g.translatePieceDepth(ctx, p, allowGlobalCache, 0)
+}
+
+func (g *Gateway) translatePieceDepth(ctx context.Context, p chunkPiece, allowGlobalCache bool, depth int) (string, error) {
+	out, err := g.translateChunkCached(ctx, p.text, allowGlobalCache)
+	if err == nil {
+		return out, nil
+	}
+	if failureClass(err) != "too-large" || depth >= maxSplitDepth || ctx.Err() != nil {
+		return "", err
+	}
+	left, right, ok := splitPiece(p)
+	if !ok {
+		return "", err
+	}
+	g.logf("translator rejected a %d-token piece as too large; splitting (%d/%d)",
+		estimateTokens(p.text), depth+1, maxSplitDepth)
+	lout, lerr := g.translatePieceDepth(ctx, left, allowGlobalCache, depth+1)
+	if lerr != nil {
+		return "", lerr
+	}
+	rout, rerr := g.translatePieceDepth(ctx, right, allowGlobalCache, depth+1)
+	if rerr != nil {
+		return "", rerr
+	}
+	// right.sep is "\n" when the split fell on a line break and "" when the
+	// two halves are contiguous text, so reassembly restores the original.
+	return lout + right.sep + rout, nil
 }
 
 // chunkPiece is one translator request's worth of masked text. sep is the
@@ -746,9 +953,14 @@ func (g *Gateway) buildPieces(masked string) []chunkPiece {
 	if limit <= 0 {
 		limit = DefaultMaxChunkRunes
 	}
+	tokenLimit := g.cfg.MaxChunkTokens
+	if tokenLimit <= 0 {
+		tokenLimit = DefaultMaxChunkTokens
+	}
 	var pieces []chunkPiece
 	var buf []string
 	size := 0
+	tokens := 0
 	flush := func() {
 		if len(buf) == 0 {
 			return
@@ -756,6 +968,7 @@ func (g *Gateway) buildPieces(masked string) []chunkPiece {
 		pieces = append(pieces, chunkPiece{text: strings.Join(buf, "\n"), sep: "\n"})
 		buf = nil
 		size = 0
+		tokens = 0
 	}
 	for _, line := range strings.Split(masked, "\n") {
 		if isSecretLine(line) {
@@ -766,13 +979,18 @@ func (g *Gateway) buildPieces(masked string) []chunkPiece {
 			continue
 		}
 		runes := []rune(line)
-		if len(runes) > limit {
+		if len(runes) > limit || estimateTokens(line) > tokenLimit {
+			// Over-long line: hard-split at a rune boundary. Whichever cap
+			// bites first decides the cut, so a piece is always inside both.
 			flush()
 			first := true
 			for len(runes) > 0 {
 				n := limit
 				if len(runes) < n {
 					n = len(runes)
+				}
+				if byTokens := runesWithinTokens(runes, tokenLimit); byTokens < n {
+					n = byTokens
 				}
 				sep := ""
 				if first {
@@ -783,11 +1001,13 @@ func (g *Gateway) buildPieces(masked string) []chunkPiece {
 			}
 			continue
 		}
-		if len(buf) > 0 && size+len(runes) > limit {
+		lineTokens := estimateTokens(line) + 1
+		if len(buf) > 0 && (size+len(runes) > limit || tokens+lineTokens > tokenLimit) {
 			flush()
 		}
 		buf = append(buf, line)
 		size += len(runes) + 1
+		tokens += lineTokens
 	}
 	flush()
 	return pieces
@@ -858,6 +1078,12 @@ func (g *Gateway) translateChunkCached(ctx context.Context, chunk string, allowG
 	}
 	if last == nil {
 		last = newFailure("unknown", failClosedMsg, "", 0, 0, nil)
+	}
+	// A size rejection is not something the fallback model can fix — the
+	// same bytes would arrive at a model that may well have the same window.
+	// The remedy is splitting, which translatePieceAdaptive does next.
+	if failureClass(last) == "too-large" {
+		return "", last
 	}
 	// Single fallback site for every primary failure mode (Han output,
 	// timeout, 5xx, quota, unreachable): one attempt on the fallback model,
@@ -938,11 +1164,19 @@ func (g *Gateway) translateOnce(ctx context.Context, chunk string) attemptOutcom
 		}
 	}
 	if status >= 400 {
+		// A size rejection is the one 4xx the gateway can fix itself: split
+		// the piece and try the halves (translatePieceAdaptive), rather than
+		// failing the whole turn over a paste that is merely long.
 		class := "http"
-		if status == http.StatusRequestEntityTooLarge || status == http.StatusRequestURITooLong {
+		if status == http.StatusRequestEntityTooLarge || status == http.StatusRequestURITooLong ||
+			(status == http.StatusBadRequest && tooLargeNamed(raw)) {
 			class = "too-large"
 		}
-		return attemptOutcome{err: newFailure(class, failClosedMsg, endpoint, status, len(raw), nil)}
+		msg := failClosedMsg
+		if class == "too-large" {
+			msg = translatorTooLargeMsg
+		}
+		return attemptOutcome{err: newFailure(class, msg, endpoint, status, len(raw), nil)}
 	}
 	out, usage, truncated, err := parseTranslation(raw)
 	if err != nil {
@@ -1033,7 +1267,12 @@ func (g *Gateway) translateFallbackOnce(ctx context.Context, chunk string) (stri
 		return "", TranslationUsage{}, newFailure("rate", failClosedMsg, endpoint, resp.StatusCode, len(raw), nil)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", TranslationUsage{}, newFailure("http", failClosedMsg, endpoint, resp.StatusCode, len(raw), nil)
+		class, msg := "http", failClosedMsg
+		if resp.StatusCode == http.StatusRequestEntityTooLarge || resp.StatusCode == http.StatusRequestURITooLong ||
+			(resp.StatusCode == http.StatusBadRequest && tooLargeNamed(raw)) {
+			class, msg = "too-large", translatorTooLargeMsg
+		}
+		return "", TranslationUsage{}, newFailure(class, msg, endpoint, resp.StatusCode, len(raw), nil)
 	}
 	out, usage, truncated, err := parseResponsesTranslation(raw)
 	if err != nil {
@@ -1204,9 +1443,39 @@ func (g *Gateway) cacheGet(key string) (string, bool) {
 // correctness: Han-free and fail-closed never depend on this cache.
 const cachePersistDebounce = 2 * time.Second
 
+// maxCacheEntries bounds the Translate Cache. A long agent session adds a
+// piece per changed message per turn, and the cache file is rewritten whole on
+// every debounce, so an unbounded map turns into a multi-megabyte disk write
+// every two seconds. Oldest-inserted entries go first: they are the messages a
+// session has moved past, and losing one costs a re-translation, never
+// correctness.
+const maxCacheEntries = 20000
+
+func (g *Gateway) cacheLimit() int {
+	if g.cfg.MaxCacheEntries > 0 {
+		return g.cfg.MaxCacheEntries
+	}
+	return maxCacheEntries
+}
+
 func (g *Gateway) cacheSet(key, value string) {
+	limit := g.cacheLimit()
 	g.cacheMu.Lock()
+	if _, exists := g.cache[key]; !exists {
+		g.cacheOrder = append(g.cacheOrder, key)
+	}
 	g.cache[key] = value
+	for len(g.cache) > limit && len(g.cacheOrder) > 0 {
+		delete(g.cache, g.cacheOrder[0])
+		g.cacheOrder = g.cacheOrder[1:]
+	}
+	if len(g.cacheOrder) == 0 {
+		g.cacheOrder = nil
+	} else if cap(g.cacheOrder)-len(g.cacheOrder) > limit {
+		// Dropping from the head leaves the tail on an ever-larger backing
+		// array; compact once it is mostly dead space.
+		g.cacheOrder = append([]string(nil), g.cacheOrder...)
+	}
 	if g.cfg.CacheFile == "" || g.cfg.CacheReadOnly {
 		g.cacheMu.Unlock()
 		return

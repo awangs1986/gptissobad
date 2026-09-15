@@ -66,6 +66,9 @@
           <label>备用翻译模型（主模型回中文时重试一次，填 - 关闭）
             <input id="fallbackModel" name="fallbackModel" placeholder="muse-spark-1.3-contributor">
           </label>
+          <label>上游上下文上限（tokens，0 = 不检查）
+            <input id="upstreamContextTokens" name="upstreamContextTokens" inputmode="numeric" placeholder="128000">
+          </label>
         </div>
         <label>OpenCode Go 密钥
           <input id="apiKey" name="apiKey" type="password" placeholder="不会回显；留空表示不改" autocomplete="new-password">
@@ -113,6 +116,7 @@
         <div><strong id="metric-completion-tokens">0</strong><span>Completion Tokens</span></div>
         <div><strong id="metric-total-tokens">0</strong><span>Total Tokens</span></div>
         <div><strong id="metric-fallback">0</strong><span>备用翻译</span></div>
+        <div><strong id="metric-budget-skips">0</strong><span>预算放弃</span></div>
       </div>
     </section>
   </div>

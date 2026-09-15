@@ -27,6 +27,11 @@ func (g *Gateway) loadCache() {
 		if k == "" || v == "" {
 			continue
 		}
+		if _, exists := g.cache[k]; !exists {
+			// Seed the eviction order: without it a loaded cache would have
+			// nothing to evict from and would grow past the cap.
+			g.cacheOrder = append(g.cacheOrder, k)
+		}
 		g.cache[k] = v
 	}
 }

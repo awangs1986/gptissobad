@@ -21,8 +21,16 @@ The sentence declaring that a Chinese user message and an accompanying English t
 _Avoid_: 冲突声明, disclaimer
 
 **Translate Cache**:
-The map from a hash of source text (plus translator model and strategy version) to its Translated Prompt. Identical chunks reuse the same English. The hash→translation map may be written to disk; the User Prompt is never stored.
+The map from a hash of source text (plus translator model and strategy version) to its Translated Prompt. Identical chunks reuse the same English. The hash→translation map may be written to disk; the User Prompt is never stored. It is bounded by oldest-inserted-first eviction, so a long session re-translates instead of growing the file forever.
 _Avoid_: session snapshot (the in-memory conversation prefix), writing conversation JSON, prompt log
+
+**Chunk**:
+One translator request's worth of text: a run of lines, or part of one over-long line. Bounded by runes AND by estimated tokens, and split in half on a translator's size rejection.
+_Avoid_: message (a chunk is not a message), batch
+
+**Coverage**:
+How much of a turn is actually translated, decided before any translator call when an upstream context window is configured. Translation is dropped from the oldest text first; the live turn is never dropped. Skipped text rides through in Chinese, like every other untranslated text.
+_Avoid_: truncation (nothing is cut), fail-closed
 
 **Translator Backend**:
 The OpenCode Go API used only to produce a Translated Prompt. It is not Codex's coding model.

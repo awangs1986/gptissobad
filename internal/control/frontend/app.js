@@ -29,6 +29,7 @@ function applyState(state, fillForm) {
     $("gatewayPort").value = state.gatewayPort || "";
     $("model").value = state.model || "";
     $("fallbackModel").value = state.fallbackModel || "";
+    $("upstreamContextTokens").value = state.upstreamContextTokens ? String(state.upstreamContextTokens) : "0";
     $("frontPort").value = state.frontPort || "";
     $("basePath").value = state.basePath || "";
   }
@@ -54,6 +55,7 @@ function applyState(state, fillForm) {
   $("metric-completion-tokens").textContent = metrics.completionTokens || 0;
   $("metric-total-tokens").textContent = metrics.totalTokens || 0;
   $("metric-fallback").textContent = metrics.fallbackRequests || 0;
+  $("metric-budget-skips").textContent = metrics.contextBudgetSkips || 0;
   if (state.credentialSource === "mimo-key") {
     keyHint.textContent = "正在使用 MiMo 直连凭据（~/.codex/mimo.key 或 MIMO_API_KEY）。";
   } else if (state.credentialSource === "pi-login") {
@@ -140,6 +142,7 @@ form.addEventListener("submit", async (event) => {
         gatewayPort: $("gatewayPort").value,
         model: $("model").value,
         fallbackModel: $("fallbackModel").value,
+        upstreamContextTokens: Math.max(0, parseInt($("upstreamContextTokens").value, 10) || 0),
         apiKey: $("apiKey").value,
         frontPort: $("frontPort").value,
         basePath: $("basePath").value,
